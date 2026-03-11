@@ -7,6 +7,8 @@ This integration is now designed for a **standalone WHMCS product** using a **se
 Required module file:
 
 - `modules/servers/releem/releem.php`
+- `modules/servers/releem/clientarea.tpl`
+- `modules/addons/releem_setup/releem_setup.php`
 
 Optional legacy addon files still exist in this repo, but they are not required for standalone product flow.
 
@@ -24,95 +26,138 @@ Optional legacy addon files still exist in this repo, but they are not required 
 Set these values:
 
 - `partner_api_key`: your Releem Partner Secret Key
-- `api_endpoint`: `https://api.releem.com`
-- `plan_config_option_id`: the WHMCS configurable option ID used for tier selection
-- `plan_mapping`: JSON map of **configurable option value ID** -> **Releem plan_id**
+- `api_endpoint`: `https://api2.releem.com`
+  You can switch to `https://api2.dev.releem.com` for development/testing.
+- `server_count_option_id`: optional override for the WHMCS configurable option ID used for server count selection
 
-Example:
+Compatibility note: existing installs using `plan_config_option_id` continue to work as a fallback.
 
-```json
-{"11":1,"12":2,"13":3}
-```
+## 3) Create Configurable Option for Server Count
 
-Meaning:
+Recommended automation:
 
-- option value ID `11` -> Releem Starter (`plan_id=1`)
-- option value ID `12` -> Releem Scale (`plan_id=2`)
-- option value ID `13` -> Releem Business (`plan_id=3`)
+1. Upload `modules/addons/releem_setup/releem_setup.php`.
+2. In WHMCS admin, activate the addon in `Configuration -> System Settings -> Addon Modules`.
+3. Open `Addons -> Releem Setup`.
+4. Click `Setup Product` for the target Releem product.
+4. The action will:
+   - create or reuse the `Servers` configurable option
+   - add values `1` through `10`
+   - link the option group to the product
+   - create `releem_public_api_key`
+   - save the detected configurable option ID into `server_count_option_id`
 
-## 3) Create Configurable Option for Tier
+Manual alternative:
 
 1. Go to `Setup -> Products/Services -> Configurable Options`.
-2. Create a group (example: `Releem Plans`).
-3. Add one dropdown/radio option (example: `Plan`).
-4. Add values:
-- `Starter (1 server)`
-- `Scale (up to 5 servers)`
-- `Business (up to 10 servers)`
-5. Assign this configurable option group to the Releem product.
-6. Note IDs of the option values from database/UI tooling and place them into `plan_mapping`.
+2. Create a configurable option named `Servers` and attach it to the product.
+3. Put that configurable option ID into `server_count_option_id`.
+4. Add the values you want to offer, for example `1` through `10`.
 
-Important: this module maps by **ID**, not by text label.
+The module reads the selected server count and sends it directly as `subscription.plan_id`.
+You still need to set pricing for the option values in WHMCS if you charge different amounts by server count.
 
 ## 4) Product Pricing
 
 In product pricing, set recurring prices for the base product.
 
-For tiered pricing, use configurable option pricing per value.
+For per-server pricing, use configurable option pricing per value.
+If you need counts above `10`, add more values to the `Servers` configurable option in WHMCS.
+
+## 5) Allow Customer Upgrades
+
+In the product configuration, enable WHMCS upgrades for configurable options.
+
+This is the intended path for increasing server count after the initial order.
 
 ## Sync Behavior
 
 Module functions:
 
-- `releem_CreateAccount()` -> creates/updates Releem customer
+- `releem_CreateAccount()` -> creates Releem customer, then syncs subscription
 - `releem_SuspendAccount()` -> sends `status=suspended`
 - `releem_UnsuspendAccount()` -> sends `status=active`
 - `releem_TerminateAccount()` -> sends `status=cancelled` (no delete)
-- `releem_ChangePackage()` -> updates plan/status
+- `releem_ChangePackage()` -> updates server-count plan/status
+- `releem_ClientArea()` -> shows agent installation details in the client area
 
-All sync paths send:
+Create sends:
 
-- numeric `plan_id`
-- `status`
+- `email`
+- `name`
+
+Update sync sends:
+
+- `name`
+- `subscription.plan_id`
+- `subscription.status`
+- `subscription.subscription_email`
+
+`subscription.plan_id` is the selected server count represented as a string value.
 
 ## Custom Fields Used (Product Custom Fields)
 
 Stored on service custom fields:
 
-- `releem_customer_id`
-- `releem_api_key`
-- `releem_plan_id`
-- `releem_status`
+- `releem_public_api_key`
 
-If missing, module creates these product custom fields automatically.
+`releem_public_api_key` is created lazily on the first successful sync that returns the public key.
+
+## Internal Metadata
+
+The module stores internal linkage in its own table:
+
+- `mod_releem_service_meta`
+
+Stored there:
+
+- `customer_id`
+- `plan_id`
+- `status`
+
+## Client Area Installation Instructions
+
+After Releem customer creation, the module stores `releem_public_api_key` and shows:
+
+- the public API key
+- the WHM installer command for cPanel/WHM servers
+- links to the official Releem installation and troubleshooting guides
+
+This content is rendered by `modules/servers/releem/clientarea.tpl`.
 
 ## API Endpoints Used
 
 - `POST /v1/customers` for create
-- `PATCH /v1/customers/{id}` for updates
+- `GET /v1/customers/by-email/{email}` for idempotent lookup
+- `PATCH /v1/customers/{id}` for subscription/status updates
 
 No delete operation is used.
 
 ## Testing Checklist
 
 1. Place module file in `modules/servers/releem/releem.php`.
-2. Create standalone Releem product and attach module.
-3. Configure module settings (`partner_api_key`, `plan_config_option_id`, `plan_mapping`).
-4. Order product with each tier and confirm correct `plan_id` in Releem.
-5. Suspend/unsuspend product and confirm status updates.
-6. Terminate product and confirm `status=cancelled`.
-7. Check `Utilities -> Logs -> Module Log` for request flow.
+2. Place template file in `modules/servers/releem/clientarea.tpl`.
+3. Place addon module file in `modules/addons/releem_setup/releem_setup.php`.
+4. Activate the addon module in WHMCS admin.
+5. Create standalone Releem product and attach module.
+6. Use `Addons -> Releem Setup` to set up the product, or create the `Servers` configurable option manually.
+7. Configure module settings (`partner_api_key`, `server_count_option_id`).
+8. Set pricing for the server-count values in WHMCS.
+9. Enable WHMCS configurable-option upgrades for the product.
+10. Order product with different server counts and confirm correct `subscription.plan_id` in Releem.
+11. Confirm the client area shows the Releem public API key and agent installation instructions.
+12. Upgrade the server count and confirm Releem receives the new `subscription.plan_id`.
+13. Suspend/unsuspend product and confirm status updates.
+14. Terminate product and confirm `status=cancelled`.
+15. Check `Utilities -> Logs -> Module Log` for request flow.
 
 ## Troubleshooting
 
 - `Partner API key not configured`
 : set `partner_api_key` in product `Module Settings`.
 
-- `Unable to resolve selected configurable option value ID`
-: set `plan_config_option_id` to the correct configurable option ID and ensure the customer selected a value.
-
-- `No plan mapping found for selected option ID`
-: add that option value ID to `plan_mapping` JSON.
+- `Unable to resolve selected server count`
+: set `server_count_option_id` to the correct configurable option ID and ensure the customer selected a numeric value.
 
 - `Cannot redeclare releem_ClientArea`
 : resolved in latest server module by removing server-side `ClientArea` function.
