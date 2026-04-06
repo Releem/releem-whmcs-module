@@ -30,15 +30,36 @@ if (!class_exists('ReleemServerApi')) {
 
         public function getCustomerByEmail($email)
         {
-            try {
-                return $this->request('GET', '/v1/customers/by-email/' . rawurlencode((string) $email));
-            } catch (Exception $e) {
-                if (strpos($e->getMessage(), 'HTTP 404') !== false) {
-                    return null;
+            // Apiary defines email lookup through the list endpoint with repeated filter params.
+            $response = $this->request('GET', '/v1/customers?filter=' . rawurlencode((string) $email));
+            if (empty($response)) {
+                return null;
+            }
+
+            if (!is_array($response)) {
+                throw new Exception('Customer lookup response is not an array');
+            }
+
+            $matches = [];
+            foreach ($response as $customer) {
+                if (!is_array($customer) || empty($customer['email'])) {
+                    continue;
                 }
 
-                throw $e;
+                if (strcasecmp(trim((string) $customer['email']), trim((string) $email)) === 0) {
+                    $matches[] = $customer;
+                }
             }
+
+            if (empty($matches)) {
+                return null;
+            }
+
+            if (count($matches) > 1) {
+                throw new Exception('Multiple customers found for email ' . (string) $email);
+            }
+
+            return $matches[0];
         }
 
         private function request($method, $path, array $data = null)
@@ -107,7 +128,7 @@ if (!function_exists('releem_ConfigOptions')) {
             'partner_api_key' => [
                 'Type' => 'password',
                 'Size' => '60',
-                'Description' => 'Releem Partner Secret Key',
+                'Description' => 'Releem secret key for customer sync',
             ],
             'api_endpoint' => [
                 'Type' => 'text',
@@ -208,8 +229,8 @@ if (!function_exists('releem_server_sync_service')) {
             }
 
             if ($partnerApiKey === '') {
-                releem_server_log('sync', ['serviceid' => $serviceId], 'Partner API key not configured');
-                return 'Partner API key not configured';
+                releem_server_log('sync', ['serviceid' => $serviceId], 'Releem secret key is not configured');
+                return 'Releem secret key is not configured';
             }
 
             $serverCount = releem_server_get_selected_server_count($params, $serviceId, $serverCountOptionId);
@@ -221,8 +242,6 @@ if (!function_exists('releem_server_sync_service')) {
                 );
                 return 'Unable to resolve selected server count';
             }
-
-            $releemPlanId = (string) $serverCount;
 
             $clientId = isset($service->userid) ? (int) $service->userid : 0;
             if ($clientId <= 0) {
@@ -247,6 +266,42 @@ if (!function_exists('releem_server_sync_service')) {
                 ? (string) $forcedStatus
                 : (isset($service->domainstatus) ? (string) $service->domainstatus : 'Active');
             $releemStatus = releem_server_map_status($whmcsStatus);
+            $subscriptionId = releem_server_get_numeric_subscription_id($service, $params);
+            // WHMCS stores lifecycle dates on the service itself; these map to the API subscription window.
+            $startedAt = releem_server_format_service_datetime(
+                releem_server_get_param($params, 'regdate') !== ''
+                    ? releem_server_get_param($params, 'regdate')
+                    : (isset($service->regdate) ? $service->regdate : ''),
+                false
+            );
+            $validTo = releem_server_format_service_datetime(
+                releem_server_get_param($params, 'nextduedate') !== ''
+                    ? releem_server_get_param($params, 'nextduedate')
+                    : (isset($service->nextduedate) ? $service->nextduedate : ''),
+                true
+            );
+            $amount = releem_server_get_service_amount($service, $params);
+            $paymentMethod = releem_server_get_payment_method_label($params, $service);
+
+            if ($subscriptionId <= 0) {
+                releem_server_log('sync', ['serviceid' => $serviceId], 'Service subscription ID is missing or invalid');
+                return 'Service subscription ID is missing or invalid';
+            }
+
+            if ($startedAt === '') {
+                releem_server_log('sync', ['serviceid' => $serviceId], 'Service registration date is missing or invalid');
+                return 'Service registration date is missing or invalid';
+            }
+
+            if ($validTo === '') {
+                releem_server_log('sync', ['serviceid' => $serviceId], 'Service next due date is missing or invalid');
+                return 'Service next due date is missing or invalid';
+            }
+
+            if ($paymentMethod === '') {
+                releem_server_log('sync', ['serviceid' => $serviceId], 'Service payment method is missing');
+                return 'Service payment method is missing';
+            }
 
             $existingCustomerId = releem_server_get_customer_id($serviceId, $packageId);
 
@@ -282,16 +337,23 @@ if (!function_exists('releem_server_sync_service')) {
             $payload = [
                 'name' => $name,
                 'subscription' => [
-                    'plan_id' => $releemPlanId,
+                    'id' => $subscriptionId,
+                    'started_at' => $startedAt,
+                    'valid_to' => $validTo,
                     'status' => $releemStatus,
                     'subscription_email' => $email,
+                    'number_servers' => $serverCount,
+                    'amount' => $amount,
+                    'invoiceid' => releem_server_get_invoice_id($params),
+                    'payment_method' => $paymentMethod,
                 ],
             ];
 
             $response = $api->updateCustomer($existingCustomerId, $payload);
             releem_server_set_service_meta($serviceId, [
                 'customer_id' => $existingCustomerId,
-                'plan_id' => $releemPlanId,
+                'subscription_id' => $subscriptionId,
+                'number_servers' => $serverCount,
                 'status' => $releemStatus,
             ]);
             releem_server_store_customer_public_api_key($serviceId, $packageId, $response);
@@ -399,7 +461,7 @@ if (!function_exists('releem_server_get_service_meta')) {
 
         $row = Capsule::table('mod_releem_service_meta')
             ->where('service_id', $serviceId)
-            ->select('customer_id', 'plan_id', 'status')
+            ->select('customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status')
             ->first();
 
         if (!$row) {
@@ -409,6 +471,8 @@ if (!function_exists('releem_server_get_service_meta')) {
         return [
             'customer_id' => isset($row->customer_id) ? (string) $row->customer_id : '',
             'plan_id' => isset($row->plan_id) ? (string) $row->plan_id : '',
+            'subscription_id' => isset($row->subscription_id) ? (string) $row->subscription_id : '',
+            'number_servers' => isset($row->number_servers) ? (string) $row->number_servers : '',
             'status' => isset($row->status) ? (string) $row->status : '',
         ];
     }
@@ -422,12 +486,16 @@ if (!function_exists('releem_server_set_service_meta')) {
             return false;
         }
 
-        $allowedKeys = ['customer_id', 'plan_id', 'status'];
+        $allowedKeys = ['customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status'];
         $data = [];
         foreach ($allowedKeys as $key) {
             if (array_key_exists($key, $values)) {
                 $data[$key] = (string) $values[$key];
             }
+        }
+
+        if (!isset($data['plan_id']) && isset($data['number_servers'])) {
+            $data['plan_id'] = $data['number_servers'];
         }
 
         if (empty($data)) {
@@ -473,10 +541,24 @@ if (!function_exists('releem_server_ensure_meta_table')) {
                     $table->integer('service_id')->unsigned();
                     $table->string('customer_id', 191)->nullable();
                     $table->string('plan_id', 191)->nullable();
+                    $table->integer('subscription_id')->unsigned()->nullable();
+                    $table->integer('number_servers')->unsigned()->nullable();
                     $table->string('status', 50)->nullable();
                     $table->timestamp('updated_at')->nullable();
                     $table->primary('service_id');
                 });
+            } else {
+                if (!$schema->hasColumn('mod_releem_service_meta', 'subscription_id')) {
+                    $schema->table('mod_releem_service_meta', function ($table) {
+                        $table->integer('subscription_id')->unsigned()->nullable()->after('plan_id');
+                    });
+                }
+
+                if (!$schema->hasColumn('mod_releem_service_meta', 'number_servers')) {
+                    $schema->table('mod_releem_service_meta', function ($table) {
+                        $table->integer('number_servers')->unsigned()->nullable()->after('subscription_id');
+                    });
+                }
             }
 
             $available = true;
@@ -492,7 +574,7 @@ if (!function_exists('releem_server_ensure_meta_table')) {
 if (!function_exists('releem_server_extract_customer_public_api_key')) {
     function releem_server_extract_customer_public_api_key(array $customer)
     {
-        foreach (['public-api-key', 'public_api_key', 'api'] as $field) {
+        foreach (['api_key', 'public-api-key', 'public_api_key', 'api'] as $field) {
             if (!empty($customer[$field])) {
                 return trim((string) $customer[$field]);
             }
@@ -1029,13 +1111,166 @@ if (!function_exists('releem_server_map_status')) {
             case 'completed':
                 return 'active';
             case 'suspended':
-                return 'suspended';
             case 'terminated':
             case 'cancelled':
-                return 'cancelled';
+                return 'deleted';
             default:
                 return 'active';
         }
+    }
+}
+
+if (!function_exists('releem_server_get_numeric_subscription_id')) {
+    function releem_server_get_numeric_subscription_id($service, array $params = [])
+    {
+        foreach (['subscriptionid', 'subscription_id'] as $paramName) {
+            $subscriptionId = releem_server_get_param($params, $paramName);
+            if ($subscriptionId !== '' && ctype_digit($subscriptionId)) {
+                return (int) $subscriptionId;
+            }
+        }
+
+        if (!isset($service->subscriptionid)) {
+            return 0;
+        }
+
+        $subscriptionId = trim((string) $service->subscriptionid);
+        if ($subscriptionId === '' || !ctype_digit($subscriptionId)) {
+            return 0;
+        }
+
+        return (int) $subscriptionId;
+    }
+}
+
+if (!function_exists('releem_server_format_service_datetime')) {
+    function releem_server_format_service_datetime($value, $endOfDay = false)
+    {
+        $value = trim((string) $value);
+        if ($value === '' || $value === '0000-00-00' || $value === '0000-00-00 00:00:00') {
+            return '';
+        }
+
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+            return $value . ($endOfDay ? 'T23:59:59Z' : 'T00:00:00Z');
+        }
+
+        $timestamp = strtotime($value);
+        if ($timestamp === false) {
+            return '';
+        }
+
+        return gmdate('Y-m-d\\TH:i:s\\Z', $timestamp);
+    }
+}
+
+if (!function_exists('releem_server_get_service_amount')) {
+    function releem_server_get_service_amount($service, array $params = [])
+    {
+        foreach (['recurringamount', 'amount'] as $paramName) {
+            $value = releem_server_get_param($params, $paramName);
+            if ($value !== '') {
+                return (float) $value;
+            }
+        }
+
+        $amount = 0;
+        if (isset($service->recurringamount) && trim((string) $service->recurringamount) !== '') {
+            $amount = (float) $service->recurringamount;
+        } elseif (isset($service->amount) && trim((string) $service->amount) !== '') {
+            $amount = (float) $service->amount;
+        }
+
+        return (float) $amount;
+    }
+}
+
+if (!function_exists('releem_server_get_invoice_id')) {
+    function releem_server_get_invoice_id(array $params)
+    {
+        foreach (['invoiceid', 'invoice_id'] as $paramName) {
+            $value = releem_server_get_param($params, $paramName);
+            if ($value !== '' && ctype_digit($value)) {
+                return (int) $value;
+            }
+        }
+
+        return 0;
+    }
+}
+
+if (!function_exists('releem_server_get_payment_method_label')) {
+    function releem_server_get_payment_method_label(array $params, $service)
+    {
+        foreach (['paymentmethodname', 'paymentmethoddisplayname', 'payment_method_name'] as $paramName) {
+            $value = releem_server_get_param($params, $paramName);
+            if ($value !== '') {
+                return $value;
+            }
+        }
+
+        $paymentMethod = releem_server_get_param($params, 'paymentmethod');
+        if ($paymentMethod === '') {
+            $paymentMethod = isset($service->paymentmethod) ? trim((string) $service->paymentmethod) : '';
+        }
+        if ($paymentMethod === '') {
+            return '';
+        }
+
+        $friendlyName = releem_server_find_payment_gateway_friendly_name($paymentMethod);
+        if ($friendlyName !== '') {
+            return $friendlyName;
+        }
+
+        // Fallback to a readable label when WHMCS exposes only the system gateway name.
+        return releem_server_humanize_identifier($paymentMethod);
+    }
+}
+
+if (!function_exists('releem_server_find_payment_gateway_friendly_name')) {
+    function releem_server_find_payment_gateway_friendly_name($gateway)
+    {
+        $gateway = trim((string) $gateway);
+        if ($gateway === '') {
+            return '';
+        }
+
+        $columns = releem_server_get_table_columns('tblpaymentgateways');
+        if (!isset($columns['gateway']) || !isset($columns['setting']) || !isset($columns['value'])) {
+            return '';
+        }
+
+        try {
+            $row = Capsule::table('tblpaymentgateways')
+                ->where('gateway', $gateway)
+                ->where(function ($query) {
+                    $query->where('setting', 'FriendlyName')
+                        ->orWhere('setting', 'name');
+                })
+                ->orderBy('setting', 'asc')
+                ->select('value')
+                ->first();
+        } catch (Exception $e) {
+            releem_server_log('paymentMethodLookup', ['gateway' => $gateway], $e->getMessage());
+            return '';
+        }
+
+        return ($row && isset($row->value)) ? trim((string) $row->value) : '';
+    }
+}
+
+if (!function_exists('releem_server_humanize_identifier')) {
+    function releem_server_humanize_identifier($value)
+    {
+        $value = trim((string) $value);
+        if ($value === '') {
+            return '';
+        }
+
+        $value = preg_replace('/[_-]+/', ' ', $value);
+        $value = preg_replace('/\s+/', ' ', (string) $value);
+
+        return ucwords(trim((string) $value));
     }
 }
 
