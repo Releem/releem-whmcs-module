@@ -1130,16 +1130,21 @@ if (!function_exists('releem_server_get_numeric_subscription_id')) {
             }
         }
 
-        if (!isset($service->subscriptionid)) {
-            return 0;
+        if (isset($service->subscriptionid)) {
+            $subscriptionId = trim((string) $service->subscriptionid);
+            if ($subscriptionId !== '' && ctype_digit($subscriptionId)) {
+                return (int) $subscriptionId;
+            }
         }
 
-        $subscriptionId = trim((string) $service->subscriptionid);
-        if ($subscriptionId === '' || !ctype_digit($subscriptionId)) {
-            return 0;
+        if (isset($service->id)) {
+            $serviceId = trim((string) $service->id);
+            if ($serviceId !== '' && ctype_digit($serviceId)) {
+                return (int) $serviceId;
+            }
         }
 
-        return (int) $subscriptionId;
+        return 0;
     }
 }
 

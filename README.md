@@ -103,7 +103,7 @@ Update sync sends:
 
 WHMCS field mapping:
 
-- `subscription.id` -> numeric service `subscriptionid`
+- `subscription.id` -> numeric service `subscriptionid`, with fallback to WHMCS service ID when `subscriptionid` is empty
 - `subscription.started_at` -> service `regdate` at start of day UTC
 - `subscription.valid_to` -> service `nextduedate` at end of day UTC
 - `subscription.number_servers` -> selected `Servers` configurable option value
@@ -179,7 +179,7 @@ No delete operation is used. Service lifecycle changes are sent through `subscri
 : set `server_count_option_id` to the correct configurable option ID and ensure the customer selected a numeric value.
 
 - `Service subscription ID is missing or invalid`
-: ensure the WHMCS service has a numeric `subscriptionid`.
+: ensure the WHMCS service exists and has either a numeric `subscriptionid` or a valid numeric service ID.
 
 - `Service registration date is missing or invalid`
 : ensure the WHMCS service `regdate` is populated.
