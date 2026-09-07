@@ -1,6 +1,6 @@
 # Releem WHMCS Module — Administrator Runbook
 
-Releem is sold as a standalone WHMCS product implemented by a server/provisioning module (`modules/servers/releem`). It is not a WHMCS Product Addon.
+The Releem WHMCS module allows Releem partners to resell Releem as a standalone product through WHMCS. It uses a server/provisioning module (`modules/servers/releem`).
 
 ## Prerequisites
 
