@@ -2,6 +2,7 @@
 .agent/
 .gstack/
 .worktrees/
+docs/
 
 # Local secrets and environment overrides
 .env
