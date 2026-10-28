@@ -392,8 +392,9 @@ if (!function_exists('releem_ClientArea')) {
             $isActive = $service && strtolower((string) $service->domainstatus) === 'active';
         }
 
-        // Never hand out the key for suspended, cancelled or terminated services.
-        if ($isActive) {
+        // Never hand out the key for suspended, cancelled or terminated services, or for an
+        // adopted customer while the WHMCS email is still unverified.
+        if ($isActive && releem_server_may_reveal_public_api_key($serviceId)) {
             $publicApiKey = releem_server_get_product_custom_field_value($serviceId, $productId, 'releem_public_api_key');
         }
 
@@ -695,7 +696,7 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
                     $existingCustomerId = (string) $existingCustomer['id'];
                     $isAdopted = true;
                     releem_server_safe_meta_write($serviceId, ['customer_id' => $existingCustomerId, 'adopted' => 1]);
-                    releem_server_store_customer_public_api_key($serviceId, $packageId, $existingCustomer);
+                    releem_server_sync_public_api_key($serviceId, $packageId, $existingCustomer, true, $client);
                 }
             }
 
@@ -758,7 +759,7 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
                 'valid_to' => $validTo,
             ]);
             try {
-                releem_server_store_customer_public_api_key($serviceId, $packageId, $response);
+                releem_server_sync_public_api_key($serviceId, $packageId, $response, $isAdopted, $client);
             } catch (\Throwable $e) {
                 releem_server_log('storePublicApiKey', ['serviceid' => $serviceId], $e->getMessage());
             }
@@ -1150,6 +1151,48 @@ if (!function_exists('releem_server_store_customer_public_api_key')) {
         if ($publicApiKey !== '') {
             releem_server_set_product_custom_field_value($serviceId, $productId, 'releem_public_api_key', $publicApiKey);
         }
+    }
+}
+
+if (!function_exists('releem_server_client_email_is_verified')) {
+    function releem_server_client_email_is_verified($client)
+    {
+        return is_object($client) && isset($client->email_verified) && releem_server_is_truthy($client->email_verified);
+    }
+}
+
+if (!function_exists('releem_server_may_reveal_public_api_key')) {
+    /**
+     * An adopted customer belongs to an account this module did not create. Its public API key is shown only after
+     * WHMCS has verified the client email, including when an administrator allowed linking by unverified email.
+     */
+    function releem_server_may_reveal_public_api_key($serviceId)
+    {
+        $meta = releem_server_get_service_meta($serviceId);
+        if (empty($meta['adopted'])) {
+            return true;
+        }
+
+        $service = Capsule::table('tblhosting')->where('id', (int) $serviceId)->select('userid')->first();
+        if (!$service || empty($service->userid)) {
+            return false;
+        }
+
+        $client = Capsule::table('tblclients')->where('id', (int) $service->userid)->select('email_verified')->first();
+
+        return releem_server_client_email_is_verified($client);
+    }
+}
+
+if (!function_exists('releem_server_sync_public_api_key')) {
+    function releem_server_sync_public_api_key($serviceId, $productId, array $customer, $isAdopted, $client)
+    {
+        if ($isAdopted && !releem_server_client_email_is_verified($client)) {
+            releem_server_set_product_custom_field_value($serviceId, $productId, 'releem_public_api_key', '');
+            return;
+        }
+
+        releem_server_store_customer_public_api_key($serviceId, $productId, $customer);
     }
 }
 

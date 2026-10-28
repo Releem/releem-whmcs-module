@@ -114,7 +114,7 @@ Typical flow:
 1. Read product, client, service, and selected server count.
 2. Resolve Releem customer:
    - use stored `customer_id` from `mod_releem_service_meta`
-   - otherwise (never when ending a subscription) look up by email through `GET /v1/customers?filter={email}`; link it only when the client's email is verified or the addon setting `allow_email_adoption` is on, and never overwrite the name of such an adopted customer
+   - otherwise (never when ending a subscription) look up by email through `GET /v1/customers?filter={email}`; link it only when the client's email is verified or the addon setting `allow_email_adoption` is on, and never overwrite the name of such an adopted customer. The public API key of an adopted customer is shown only after the WHMCS email is verified.
    - otherwise create new customer
 3. Build update payload with:
    - `name`

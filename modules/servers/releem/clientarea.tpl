@@ -290,7 +290,10 @@
             if (os === 'windows') {
                 var ps = ['$env:RELEEM_DB_MEMORY_LIMIT=' + mem, '$env:RELEEM_API_KEY=' + psQuote(API_KEY), '$env:RELEEM_CRON_ENABLE=1'];
                 if (queryOptimization) { ps.push('$env:RELEEM_QUERY_OPTIMIZATION="true"'); }
-                ps.push('iwr -useb https://releem.s3.amazonaws.com/v2/install.ps1 | iex');
+                ps.push('[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12');
+                ps.push("$releemInstaller = 'https://releem.s3.amazonaws.com/v2/install.ps1'");
+                ps.push("if ($releemInstaller -notlike 'https://*') { throw 'Releem installer URL must use HTTPS' }");
+                ps.push('Invoke-Expression (Invoke-WebRequest -UseBasicParsing -Uri $releemInstaller).Content');
                 return ps.join('; ');
             }
             var parts = [db === 'postgresql' ? 'RELEEM_PG_TYPE=1' : 'RELEEM_MYSQL_TYPE=1',
