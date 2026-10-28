@@ -38,6 +38,13 @@ Security and reliability release following a full code audit. No Releem API cont
 
 ### Fixed
 
+- Suspending or terminating the subscription-owning service now sends `deleted` even when a higher-ID Active
+  duplicate exists. Only a lower-ID service with a confirmed active Releem link can suppress deactivation;
+  unprovisioned duplicates no longer leave a subscription active.
+- Provisioning now reads the partner token from the assigned server record with strict decryption. An undecryptable
+  `serverpassword` parameter is rejected instead of being sent as the token. The administrator's Test Connection
+  action still accepts an unsaved plain-text token.
+
 - **Subscription ID is always the WHMCS service ID.** Numeric gateway `subscriptionid` values are no longer used: they
   live in another number space and could equal an unrelated service's ID. Subscription IDs already sent to Releem keep
   their value, and a sync is refused if another service already sent the same ID.
