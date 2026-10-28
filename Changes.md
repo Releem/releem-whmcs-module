@@ -17,7 +17,10 @@ Security and reliability release following a full code audit. No Releem API cont
 - Ending a subscription (suspend, cancel, terminate) never looks a customer up by email. It only acts on a customer the
   service was already linked to.
 - Customers that were linked by email are flagged `adopted` in `mod_releem_service_meta`; the module never sends a
-  `name` update for them. Customers linked before this release are not flagged.
+  `name` update for them.
+- The public API key of an adopted customer is stored and shown only after the client email is verified in WHMCS.
+  Turning on **Link existing Releem customers by email** can still attach the subscription, but it does not reveal
+  the key while the email is unverified.
 - **Partner API token is only sent to Releem.** The server hostname (and the legacy product endpoint) must be
   `releem.com` or a subdomain such as `api2.releem.com` or `api2.dev.releem.com`. IP addresses, `localhost` and foreign
   hosts are refused. A trailing dot in the hostname is accepted.
@@ -30,7 +33,8 @@ Security and reliability release following a full code audit. No Releem API cont
   and similar are redacted, and email addresses inside free text become `[EMAIL]`). The duplicate-customer error no
   longer includes the email.
 - Generated install commands use `curl -fsSL --proto '=https' --tlsv1.2`, so an HTTP error page is never executed as
-  root and the download cannot fall back to plain HTTP. Removed the unused `releem_server_build_whm_install_command`.
+  root and the download cannot fall back to plain HTTP. The Windows command forces TLS 1.2 and an `https://` installer
+  URL before `Invoke-WebRequest`. Removed the unused `releem_server_build_whm_install_command`.
 
 ### Fixed
 
