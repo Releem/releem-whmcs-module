@@ -334,7 +334,8 @@ if (!function_exists('releem_TestConnection')) {
     function releem_TestConnection(array $params)
     {
         try {
-            $credentials = releem_server_resolve_credentials($params, (object) []);
+            // The server form can contain a new, unsaved plain-text token.
+            $credentials = releem_server_resolve_credentials($params, (object) [], true);
             if ($credentials['error'] !== '') {
                 return ['success' => false, 'error' => $credentials['error']];
             }
@@ -559,19 +560,19 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
             $name = $company !== '' ? $company : ($fullName !== '' ? $fullName : $email);
 
             // One Releem subscription exists per Releem customer, so only one active service per client may own it.
-            $otherActiveServiceId = releem_server_find_other_active_service_id($serviceId, $clientId);
+            $otherActiveServiceId = releem_server_find_other_active_service_id($serviceId, $clientId, $isDelete);
             if ($otherActiveServiceId > 0) {
-                if ($isDelete) {
+                if ($isDelete && $otherActiveServiceId < $serviceId) {
                     releem_server_log(
                         'sync',
                         ['serviceid' => $serviceId],
-                        'Skipped status change: client has another active Releem service #' . $otherActiveServiceId
+                        'Skipped status change: subscription belongs to active Releem service #' . $otherActiveServiceId
                     );
                     releem_server_set_service_meta($serviceId, ['status' => $releemStatus]);
                     return 'success';
                 }
 
-                if ($otherActiveServiceId < $serviceId) {
+                if (!$isDelete && $otherActiveServiceId < $serviceId) {
                     $message = 'Client already has an active Releem service (#' . $otherActiveServiceId
                         . '); only one Releem service per client is supported';
                     releem_server_log('sync', ['serviceid' => $serviceId], $message);
@@ -787,16 +788,27 @@ if (!function_exists('releem_server_safe_meta_write')) {
 if (!function_exists('releem_server_find_other_active_service_id')) {
     /**
      * Lowest ID of another Active Releem service owned by the same client, or 0.
+     * Ending a subscription only defers to services with a confirmed active Releem link.
      */
-    function releem_server_find_other_active_service_id($serviceId, $clientId)
+    function releem_server_find_other_active_service_id($serviceId, $clientId, $provisionedOnly = false)
     {
-        $row = Capsule::table('tblhosting as h')
+        $query = Capsule::table('tblhosting as h')
             ->join('tblproducts as p', 'p.id', '=', 'h.packageid')
             ->where('h.userid', (int) $clientId)
             ->where('h.id', '!=', (int) $serviceId)
             ->where('h.domainstatus', 'Active')
-            ->where('p.servertype', 'releem')
-            ->orderBy('h.id', 'asc')
+            ->where('p.servertype', 'releem');
+
+        if ($provisionedOnly) {
+            if (!releem_server_ensure_meta_table()) {
+                return 0;
+            }
+            $query->join('mod_releem_service_meta as m', 'm.service_id', '=', 'h.id')
+                ->where('m.customer_id', '!=', '')
+                ->where('m.status', 'active');
+        }
+
+        $row = $query->orderBy('h.id', 'asc')
             ->select('h.id')
             ->first();
 
@@ -1408,13 +1420,16 @@ if (!function_exists('releem_server_decrypt_secret')) {
     function releem_server_decrypt_secret($raw, $mustBeEncrypted = false)
     {
         $raw = trim((string) $raw);
-        if ($raw === '' || !function_exists('decrypt')) {
+        if ($raw === '') {
             return $raw;
         }
 
         // A value read straight from the database is always encrypted by WHMCS. If it cannot be decrypted (changed
         // encryption hash, corrupted value) the ciphertext must never be sent to Releem as if it were the token.
         $fallback = $mustBeEncrypted ? '' : $raw;
+        if (!function_exists('decrypt')) {
+            return $fallback;
+        }
 
         try {
             $decrypted = decrypt($raw);
@@ -1535,15 +1550,20 @@ if (!function_exists('releem_server_resolve_credentials')) {
      *
      * @return array ['key' => string, 'endpoint' => string, 'error' => string]
      */
-    function releem_server_resolve_credentials(array $params, $service)
+    function releem_server_resolve_credentials(array $params, $service, $allowPlaintextPassword = false)
     {
-        $key = releem_server_decrypt_secret(releem_server_get_param($params, 'serverpassword'));
+        // Provisioning trusts the encrypted server record, not an ambiguous printable parameter that may be ciphertext.
+        // Only Test Connection accepts a raw token from the unsaved administrator form.
+        $record = $allowPlaintextPassword ? null : releem_server_load_server_record($service);
+        $key = releem_server_decrypt_secret(releem_server_get_param($params, 'serverpassword'), !$allowPlaintextPassword);
         $host = releem_server_get_param($params, 'serverhostname');
         $port = releem_server_get_param($params, 'serverport');
         $secure = releem_server_get_param($params, 'serversecure');
 
-        if ($key === '' || $host === '') {
-            $record = releem_server_load_server_record($service);
+        if ($record || $key === '' || $host === '') {
+            if (!$record) {
+                $record = releem_server_load_server_record($service);
+            }
             if ($record) {
                 $key = releem_server_decrypt_secret(isset($record->password) ? $record->password : '', true);
                 $host = trim((string) (isset($record->hostname) && trim((string) $record->hostname) !== '' ? $record->hostname : (isset($record->ipaddress) ? $record->ipaddress : '')));
