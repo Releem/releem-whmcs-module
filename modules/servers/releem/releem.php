@@ -671,6 +671,7 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
             // A customer that was found by email (not created by this module) belongs to someone whose ownership of
             // the email was never proven here. Its name is never overwritten.
             $isAdopted = !empty($meta['adopted']);
+            $adoptedEmailHash = isset($meta['adopted_email_hash']) ? (string) $meta['adopted_email_hash'] : '';
 
             $api = new ReleemServerApi($partnerApiKey, $apiEndpoint);
 
@@ -680,7 +681,15 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
                 if ($linked['customer_id'] !== '') {
                     $existingCustomerId = $linked['customer_id'];
                     $isAdopted = $linked['adopted'];
-                    releem_server_safe_meta_write($serviceId, ['customer_id' => $existingCustomerId, 'adopted' => $isAdopted ? 1 : 0]);
+                    $adoptedEmailHash = $linked['adopted_email_hash'];
+                    $saved = releem_server_safe_meta_write($serviceId, [
+                        'customer_id' => $existingCustomerId,
+                        'adopted' => $isAdopted ? 1 : 0,
+                        'adopted_email_hash' => $adoptedEmailHash,
+                    ]);
+                    if ($isAdopted && !$saved) {
+                        throw new Exception('Unable to save adopted customer identity; retry the sync');
+                    }
                 }
             }
 
@@ -698,7 +707,14 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
 
                     $existingCustomerId = (string) $existingCustomer['id'];
                     $isAdopted = true;
-                    releem_server_safe_meta_write($serviceId, ['customer_id' => $existingCustomerId, 'adopted' => 1]);
+                    $adoptedEmailHash = releem_server_email_hash($email);
+                    if (!releem_server_safe_meta_write($serviceId, [
+                        'customer_id' => $existingCustomerId,
+                        'adopted' => 1,
+                        'adopted_email_hash' => $adoptedEmailHash,
+                    ])) {
+                        throw new Exception('Unable to save adopted customer identity; retry the sync');
+                    }
                     releem_server_sync_public_api_key($serviceId, $packageId, $existingCustomer, true, $client);
                 }
             }
@@ -756,6 +772,7 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
             releem_server_safe_meta_write($serviceId, [
                 'customer_id' => $existingCustomerId,
                 'adopted' => $isAdopted ? 1 : 0,
+                'adopted_email_hash' => $adoptedEmailHash,
                 'subscription_id' => $subscriptionId,
                 'number_servers' => $serverCount,
                 'status' => $releemStatus,
@@ -790,9 +807,9 @@ if (!function_exists('releem_server_safe_meta_write')) {
 if (!function_exists('releem_server_find_other_active_service_id')) {
     /**
      * Lowest ID of another Active Releem service owned by the same client, or 0.
-     * Ending a subscription only defers to services with a confirmed active Releem link.
+     * Provisioned candidates have previously sent a subscription ID, including services awaiting restoration.
      */
-    function releem_server_find_other_active_service_id($serviceId, $clientId, $provisionedOnly = false)
+    function releem_server_find_other_active_service_id($serviceId, $clientId, $provisionedOnly = false, $activeSubscriptionOnly = false)
     {
         $query = Capsule::table('tblhosting as h')
             ->join('tblproducts as p', 'p.id', '=', 'h.packageid')
@@ -807,7 +824,10 @@ if (!function_exists('releem_server_find_other_active_service_id')) {
             }
             $query->join('mod_releem_service_meta as m', 'm.service_id', '=', 'h.id')
                 ->where('m.customer_id', '!=', '')
-                ->where('m.status', 'active');
+                ->where('m.subscription_id', '>', 0);
+            if ($activeSubscriptionOnly) {
+                $query->where('m.status', 'active');
+            }
         }
 
         $row = $query->orderBy('h.id', 'asc')
@@ -820,18 +840,26 @@ if (!function_exists('releem_server_find_other_active_service_id')) {
 
 if (!function_exists('releem_server_find_subscription_owner_id')) {
     /**
-     * A successfully synced active service keeps ownership even if a lower-ID service activates later.
+     * A successfully synced service keeps ownership across suspension, even if a lower-ID service activates later.
      * Lowest ID is only the tie-breaker for unprovisioned services or conflicting existing active links.
      */
     function releem_server_find_subscription_owner_id($serviceId, $clientId, array $meta)
     {
-        $otherOwnerId = releem_server_find_other_active_service_id($serviceId, $clientId, true);
-        $ownsSubscription = !empty($meta['customer_id']) && isset($meta['status']) && $meta['status'] === 'active';
-        if ($ownsSubscription) {
+        $otherOwnerId = releem_server_find_other_active_service_id($serviceId, $clientId, true, true);
+        $ownsSubscription = !empty($meta['customer_id']) && !empty($meta['subscription_id']);
+        if ($ownsSubscription && isset($meta['status']) && $meta['status'] === 'active') {
             return $otherOwnerId > 0 ? min((int) $serviceId, $otherOwnerId) : (int) $serviceId;
         }
         if ($otherOwnerId > 0) {
             return $otherOwnerId;
+        }
+        if ($ownsSubscription) {
+            return (int) $serviceId;
+        }
+
+        $formerOwnerId = releem_server_find_other_active_service_id($serviceId, $clientId, true);
+        if ($formerOwnerId > 0) {
+            return $formerOwnerId;
         }
 
         $otherActiveId = releem_server_find_other_active_service_id($serviceId, $clientId);
@@ -870,7 +898,7 @@ if (!function_exists('releem_server_find_client_customer')) {
      */
     function releem_server_find_client_customer($clientId, $serviceId)
     {
-        $none = ['customer_id' => '', 'adopted' => false];
+        $none = ['customer_id' => '', 'adopted' => false, 'adopted_email_hash' => ''];
         if (!releem_server_ensure_meta_table()) {
             return $none;
         }
@@ -882,14 +910,18 @@ if (!function_exists('releem_server_find_client_customer')) {
             ->whereNotNull('m.customer_id')
             ->where('m.customer_id', '!=', '')
             ->orderBy('h.id', 'desc')
-            ->select('m.customer_id', 'm.adopted')
+            ->select('m.customer_id', 'm.adopted', 'm.adopted_email_hash')
             ->first();
 
         if (!$row || !isset($row->customer_id)) {
             return $none;
         }
 
-        return ['customer_id' => (string) $row->customer_id, 'adopted' => !empty($row->adopted)];
+        return [
+            'customer_id' => (string) $row->customer_id,
+            'adopted' => !empty($row->adopted),
+            'adopted_email_hash' => isset($row->adopted_email_hash) ? (string) $row->adopted_email_hash : '',
+        ];
     }
 }
 
@@ -1071,7 +1103,7 @@ if (!function_exists('releem_server_reconcile_all')) {
                 // Least recently attempted first, so rows that never converge cannot starve the others.
                 ->orderBy('m.updated_at', 'asc')
                 ->orderBy('h.id', 'asc')
-                ->select('h.id', 'h.userid', 'h.packageid', 'h.domainstatus', 'h.nextduedate', 'h.billingcycle', 'h.regdate', 'm.customer_id as meta_customer_id', 'm.status as meta_status', 'm.valid_to as meta_valid_to', 'm.number_servers as meta_servers')
+                ->select('h.id', 'h.userid', 'h.packageid', 'h.domainstatus', 'h.nextduedate', 'h.billingcycle', 'h.regdate', 'm.customer_id as meta_customer_id', 'm.subscription_id as meta_subscription_id', 'm.status as meta_status', 'm.valid_to as meta_valid_to', 'm.number_servers as meta_servers')
                 ->get();
 
             $optionIds = [];
@@ -1081,17 +1113,6 @@ if (!function_exists('releem_server_reconcile_all')) {
                 }
 
                 $expectedStatus = releem_server_map_status($row->domainstatus);
-
-                // Skip duplicates while allowing the provisioned owner to reconcile regardless of its service ID.
-                if ($expectedStatus === 'active') {
-                    $ownerId = releem_server_find_subscription_owner_id((int) $row->id, (int) $row->userid, [
-                        'customer_id' => $row->meta_customer_id,
-                        'status' => $row->meta_status,
-                    ]);
-                    if ($ownerId !== (int) $row->id) {
-                        continue;
-                    }
-                }
 
                 $expectedValidTo = releem_server_get_service_valid_to($row);
                 $statusDiffers = (string) $row->meta_status !== $expectedStatus;
@@ -1114,6 +1135,17 @@ if (!function_exists('releem_server_reconcile_all')) {
                 }
 
                 if ($statusDiffers || $validToDiffers || $serversDiffer) {
+                    // Ownership joins are only needed for services with actual drift.
+                    if ($expectedStatus === 'active') {
+                        $ownerId = releem_server_find_subscription_owner_id((int) $row->id, (int) $row->userid, [
+                            'customer_id' => $row->meta_customer_id,
+                            'subscription_id' => $row->meta_subscription_id,
+                            'status' => $row->meta_status,
+                        ]);
+                        if ($ownerId !== (int) $row->id) {
+                            continue;
+                        }
+                    }
                     $results[(int) $row->id] = releem_server_resync_service((int) $row->id);
 
                     if ($results[(int) $row->id] !== 'success') {
@@ -1223,14 +1255,25 @@ if (!function_exists('releem_server_client_email_is_verified')) {
     }
 }
 
+if (!function_exists('releem_server_email_hash')) {
+    function releem_server_email_hash($email)
+    {
+        $email = strtolower(trim((string) $email));
+        return $email !== '' ? hash('sha256', $email) : '';
+    }
+}
+
 if (!function_exists('releem_server_may_reveal_public_api_key')) {
     /**
      * An adopted customer belongs to an account this module did not create. Its public API key is shown only after
-     * WHMCS has verified the client email, including when an administrator allowed linking by unverified email.
+     * WHMCS has verified the original adoption email, including when an admin allowed unverified email adoption.
      */
     function releem_server_may_reveal_public_api_key($serviceId)
     {
         $meta = releem_server_get_service_meta($serviceId);
+        if (empty($meta['customer_id']) || !array_key_exists('adopted', $meta)) {
+            return false;
+        }
         if (empty($meta['adopted'])) {
             return true;
         }
@@ -1242,18 +1285,26 @@ if (!function_exists('releem_server_may_reveal_public_api_key')) {
 
         $client = Capsule::table('tblclients')->where('id', (int) $service->userid)->first();
 
-        return releem_server_client_email_is_verified($client);
+        $adoptedEmailHash = isset($meta['adopted_email_hash']) ? (string) $meta['adopted_email_hash'] : '';
+        return $client
+            && $adoptedEmailHash !== ''
+            && hash_equals($adoptedEmailHash, releem_server_email_hash($client->email))
+            && releem_server_client_email_is_verified($client);
     }
 }
 
 if (!function_exists('releem_server_sync_public_api_key')) {
     function releem_server_sync_public_api_key($serviceId, $productId, array $customer, $isAdopted, $client)
     {
-        if ($isAdopted && !releem_server_client_email_is_verified($client)) {
-            releem_server_set_product_custom_field_value($serviceId, $productId, 'releem_public_api_key', '');
-            return;
+        if ($isAdopted) {
+            $meta = releem_server_get_service_meta($serviceId);
+            if (empty($meta['adopted']) || empty($meta['customer_id']) || empty($meta['adopted_email_hash'])) {
+                return;
+            }
         }
 
+        // This admin-only field is a server-side cache. Visibility requires verification of the original adoption
+        // email, so its verification can reveal the cached key immediately without another provisioning action.
         releem_server_store_customer_public_api_key($serviceId, $productId, $customer);
     }
 }
@@ -1291,7 +1342,7 @@ if (!function_exists('releem_server_get_service_meta')) {
 
         $row = Capsule::table('mod_releem_service_meta')
             ->where('service_id', $serviceId)
-            ->select('customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status', 'valid_to', 'adopted')
+            ->select('customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status', 'valid_to', 'adopted', 'adopted_email_hash')
             ->first();
 
         if (!$row) {
@@ -1306,6 +1357,7 @@ if (!function_exists('releem_server_get_service_meta')) {
             'status' => isset($row->status) ? (string) $row->status : '',
             'valid_to' => isset($row->valid_to) ? (string) $row->valid_to : '',
             'adopted' => !empty($row->adopted) ? '1' : '',
+            'adopted_email_hash' => isset($row->adopted_email_hash) ? (string) $row->adopted_email_hash : '',
         ];
     }
 }
@@ -1318,7 +1370,7 @@ if (!function_exists('releem_server_set_service_meta')) {
             return false;
         }
 
-        $allowedKeys = ['customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status', 'valid_to', 'adopted'];
+        $allowedKeys = ['customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status', 'valid_to', 'adopted', 'adopted_email_hash'];
         $data = [];
         foreach ($allowedKeys as $key) {
             if (array_key_exists($key, $values)) {
@@ -1387,6 +1439,7 @@ if (!function_exists('releem_server_ensure_meta_table')) {
                     $table->string('status', 50)->nullable();
                     $table->string('valid_to', 40)->nullable();
                     $table->boolean('adopted')->default(0);
+                    $table->string('adopted_email_hash', 64)->nullable();
                     $table->timestamp('updated_at')->nullable();
                     $table->primary('service_id');
                 });
@@ -1418,6 +1471,11 @@ if (!function_exists('releem_server_ensure_meta_table')) {
                 if (!$schema->hasColumn('mod_releem_service_meta', 'adopted')) {
                     $schema->table('mod_releem_service_meta', function ($table) {
                         $table->boolean('adopted')->default(0)->after('valid_to');
+                    });
+                }
+                if (!$schema->hasColumn('mod_releem_service_meta', 'adopted_email_hash')) {
+                    $schema->table('mod_releem_service_meta', function ($table) {
+                        $table->string('adopted_email_hash', 64)->nullable()->after('adopted');
                     });
                 }
             }

@@ -12,7 +12,7 @@ if (!function_exists('releem_setup_config')) {
         return [
             'name' => 'Releem Setup',
             'description' => 'Releem services dashboard, sales report and product setup for the Releem WHMCS module.',
-            'version' => '1.3.1',
+            'version' => '1.3.2',
             'author' => 'Releem',
             'fields' => [
                 'allow_email_adoption' => [

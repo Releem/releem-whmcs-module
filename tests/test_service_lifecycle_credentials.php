@@ -33,6 +33,7 @@ namespace {
             return $this;
         }
         public function whereNotNull($key) { return $this->where($key, '!=', null); }
+        public function value($key) { $row = $this->first(); return $row ? ($row->$key ?? null) : null; }
         public function orderBy(...$args) { return $this; }
         public function select(...$args) { return $this; }
         public function first()
@@ -46,7 +47,7 @@ namespace {
                 }
                 foreach ($this->filters as [$key, $operator, $value]) {
                     $equal = ($row[$key] ?? null) == $value;
-                    if (($operator === '!=' && $equal) || ($operator === '=' && !$equal)) { continue 2; }
+                    if (($operator === '!=' && $equal) || ($operator === '=' && !$equal) || ($operator === '>' && ($row[$key] ?? 0) <= $value)) { continue 2; }
                 }
                 return (object) $row;
             }
@@ -64,6 +65,7 @@ namespace {
     function releem_server_get_service_meta($id) { return $GLOBALS['regressionMeta'][$id] ?? []; }
     function releem_server_set_service_meta($id, array $values)
     {
+        if (!empty($GLOBALS['failAdoptionWrite']) && !empty($values['adopted'])) { return false; }
         $GLOBALS['regressionMeta'][$id] = array_merge($GLOBALS['regressionMeta'][$id] ?? [], $values);
         return true;
     }
@@ -209,6 +211,60 @@ namespace {
     });
     regressionCheck(strpos(releem_server_sync_service_unlocked($params, 'Active'),
         'enable "Link existing Releem customers by email"') !== false, 'Adoption error must use the exact addon setting label');
+    ReleemServerApi::setTransport(null);
+
+    $params = lifecycleFixture(10, 5, false);
+    $GLOBALS['regressionMeta'][10]['status'] = 'deleted';
+    $GLOBALS['regressionRows']['tblhosting'][0]['domainstatus'] = 'Suspended';
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success', 'A suspended provisioned owner must retain priority over an unprovisioned lower-ID duplicate');
+    $GLOBALS['regressionMeta'][10]['status'] = 'deleted';
+    $GLOBALS['regressionRows']['tblhosting'][0]['domainstatus'] = 'Active';
+    regressionCheck(releem_server_sync_service_unlocked($params) === 'success', 'Re-sync must restore the former owner');
+    $GLOBALS['regressionMeta'][10]['status'] = 'deleted';
+    $params['serviceid'] = 5;
+    $callsBefore = count($GLOBALS['regressionCalls']);
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') !== 'success'
+        && count($GLOBALS['regressionCalls']) === $callsBefore, 'A lower-ID duplicate must not steal a provisioned owner awaiting restoration');
+
+    $params = lifecycleFixture(1, 42, true);
+    $GLOBALS['regressionMeta'][1]['status'] = 'deleted';
+    $GLOBALS['regressionRows']['tblhosting'][0]['domainstatus'] = 'Suspended';
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') !== 'success'
+        && count($GLOBALS['regressionCalls']) === 0, 'A suspended former owner must not steal a different live provisioned owner');
+    $GLOBALS['regressionRows']['tblhosting'][0]['domainstatus'] = 'Active';
+    $params['serviceid'] = 42;
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success', 'A live owner must not lose to a former lower-ID owner awaiting restoration');
+
+    function adoptionFixture()
+    {
+        $params = lifecycleFixture(1, 42, false);
+        $GLOBALS['regressionMeta'] = [];
+        $GLOBALS['regressionRows']['tblhosting'][1]['domainstatus'] = 'Suspended';
+        $GLOBALS['regressionRows']['tbladdonmodules'] = [['module'=>'releem_setup', 'setting'=>'allow_email_adoption', 'value'=>'on']];
+        ReleemServerApi::setTransport(function ($method, $url, $headers, $body) {
+            $GLOBALS['regressionCalls'][] = ['method'=>$method, 'payload'=>json_decode($body ?? 'null', true)];
+            $customer = ['id'=>'adopted-customer', 'email'=>'test@example.invalid', 'api_key'=>'public-test-key'];
+            return ['status'=>200, 'body'=>json_encode($method === 'GET' ? [$customer] : $customer)];
+        });
+        return $params;
+    }
+    $params = adoptionFixture();
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success'
+        && $GLOBALS['regressionMeta'][1]['adopted_email_hash'] === hash('sha256', 'test@example.invalid'), 'Adoption must persist the original matched email hash');
+    $GLOBALS['regressionRows']['tblclients'][0]['email'] = 'attacker@example.invalid';
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success'
+        && $GLOBALS['regressionMeta'][1]['adopted_email_hash'] === hash('sha256', 'test@example.invalid'), 'Later syncs must never replace adoption provenance with the current email');
+    $GLOBALS['regressionRows']['tblhosting'][0]['domainstatus'] = 'Suspended';
+    $GLOBALS['regressionMeta'][1]['status'] = 'deleted';
+    $GLOBALS['regressionRows']['tblhosting'][1]['domainstatus'] = 'Active';
+    $params['serviceid'] = 42;
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success'
+        && $GLOBALS['regressionMeta'][42]['adopted_email_hash'] === hash('sha256', 'test@example.invalid'), 'A sibling customer link must retain the original adoption provenance');
+    $params = adoptionFixture();
+    $GLOBALS['failAdoptionWrite'] = true;
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') !== 'success'
+        && count($GLOBALS['regressionCalls']) === 1 && !isset($GLOBALS['regressionMeta'][1]), 'A failed identity write must stop adoption before caching a key or patching the customer');
+    $GLOBALS['failAdoptionWrite'] = false;
     ReleemServerApi::setTransport(null);
 
     if ($failures) {
