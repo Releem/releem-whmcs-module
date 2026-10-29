@@ -49,8 +49,16 @@ if (!class_exists('ReleemServerApi')) {
          */
         public static function isAllowedHost($host)
         {
-            $host = strtolower(rtrim(trim((string) $host), '.'));
-            if ($host === '' || filter_var($host, FILTER_VALIDATE_IP) !== false || preg_match('/^[0-9.]+$/', $host)) {
+            $host = strtolower(trim((string) $host));
+            if (substr($host, -1) === '.') {
+                $host = substr($host, 0, -1);
+            }
+            if (
+                $host === ''
+                || filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) === false
+                || filter_var($host, FILTER_VALIDATE_IP) !== false
+                || preg_match('/^[0-9.]+$/', $host)
+            ) {
                 return false;
             }
 
@@ -79,12 +87,17 @@ if (!class_exists('ReleemServerApi')) {
                 || isset($parts['pass'])
                 || isset($parts['query'])
                 || isset($parts['fragment'])
+                || (isset($parts['path']) && !in_array($parts['path'], ['', '/'], true))
+                || (isset($parts['port']) && ($parts['port'] < 1 || $parts['port'] > 65535))
                 || preg_match('/\s/', $endpoint)
             ) {
                 throw new InvalidArgumentException('Releem API endpoint must be a valid https:// URL on a releem.com host');
             }
 
-            return rtrim($endpoint, '/');
+            $host = strtolower(rtrim($parts['host'], '.'));
+            $port = isset($parts['port']) ? (int) $parts['port'] : 443;
+
+            return 'https://' . $host . ($port === 443 ? '' : ':' . $port);
         }
 
         public function __construct($apiKey, $endpoint = self::DEFAULT_ENDPOINT)
@@ -618,17 +631,7 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
                     : (isset($service->regdate) ? $service->regdate : ''),
                 false
             );
-            $validTo = releem_server_format_service_datetime(
-                releem_server_get_param($params, 'nextduedate') !== ''
-                    ? releem_server_get_param($params, 'nextduedate')
-                    : (isset($service->nextduedate) ? $service->nextduedate : ''),
-                true
-            );
-            // Free and One Time services have no next due date (0000-00-00). They never renew, so give the Releem
-            // subscription a long fixed window instead of rejecting the service.
-            if ($validTo === '' && !$isDelete && releem_server_is_non_recurring_cycle(isset($service->billingcycle) ? $service->billingcycle : '')) {
-                $validTo = releem_server_non_recurring_valid_to($startedAt);
-            }
+            $validTo = releem_server_get_service_valid_to($service, $params, !$isDelete);
             $amount = releem_server_get_service_amount($service, $params);
             $paymentMethod = releem_server_get_payment_method_label($params, $service);
 
@@ -672,7 +675,7 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
 
             $api = new ReleemServerApi($partnerApiKey, $apiEndpoint);
 
-            if ($existingCustomerId === '') {
+            if ($existingCustomerId === '' && !$isDelete) {
                 // Reuse the Releem customer already linked to another service of this client (survives email changes).
                 $linked = releem_server_find_client_customer($clientId, $serviceId);
                 if ($linked['customer_id'] !== '') {
@@ -835,11 +838,7 @@ if (!function_exists('releem_server_adoption_allowed')) {
             // Treated as "not enabled".
         }
 
-        if (is_object($client) && isset($client->email_verified)) {
-            return releem_server_is_truthy($client->email_verified);
-        }
-
-        return false;
+        return releem_server_client_email_is_verified($client);
     }
 }
 
@@ -1052,7 +1051,7 @@ if (!function_exists('releem_server_reconcile_all')) {
                 // Least recently attempted first, so rows that never converge cannot starve the others.
                 ->orderBy('m.updated_at', 'asc')
                 ->orderBy('h.id', 'asc')
-                ->select('h.id', 'h.userid', 'h.packageid', 'h.domainstatus', 'h.nextduedate', 'm.status as meta_status', 'm.valid_to as meta_valid_to', 'm.number_servers as meta_servers')
+                ->select('h.id', 'h.userid', 'h.packageid', 'h.domainstatus', 'h.nextduedate', 'h.billingcycle', 'h.regdate', 'm.status as meta_status', 'm.valid_to as meta_valid_to', 'm.number_servers as meta_servers')
                 ->get();
 
             $optionIds = [];
@@ -1072,7 +1071,7 @@ if (!function_exists('releem_server_reconcile_all')) {
                     }
                 }
 
-                $expectedValidTo = releem_server_format_service_datetime($row->nextduedate, true);
+                $expectedValidTo = releem_server_get_service_valid_to($row);
                 $statusDiffers = (string) $row->meta_status !== $expectedStatus;
                 $validToDiffers = $expectedStatus === 'active'
                     && $expectedValidTo !== ''
@@ -1169,7 +1168,36 @@ if (!function_exists('releem_server_store_customer_public_api_key')) {
 if (!function_exists('releem_server_client_email_is_verified')) {
     function releem_server_client_email_is_verified($client)
     {
-        return is_object($client) && isset($client->email_verified) && releem_server_is_truthy($client->email_verified);
+        if (!is_object($client) || empty($client->email)) {
+            return false;
+        }
+
+        // WHMCS 8 verifies the account owner's user email, which can differ from the client's billing email.
+        // A verified owner only proves ownership of the address actually used for adoption when both match.
+        if (class_exists('WHMCS\\User\\Client') && method_exists('WHMCS\\User\\Client', 'owner')) {
+            try {
+                if (empty($client->id)) {
+                    return false;
+                }
+                $model = \WHMCS\User\Client::find((int) $client->id);
+                if (!$model) {
+                    return false;
+                }
+                $owner = $model->owner();
+                $email = trim((string) $client->email);
+
+                return $owner
+                    && strcasecmp(trim((string) $owner->email), $email) === 0
+                    && strcasecmp(trim((string) $model->email), $email) === 0
+                    && $model->isEmailAddressVerified();
+            } catch (\Throwable $e) {
+                releem_server_log('emailVerification', ['clientid' => isset($client->id) ? (int) $client->id : 0], $e->getMessage());
+                return false;
+            }
+        }
+
+        // WHMCS 7 predates separate user accounts and keeps verification on the client itself.
+        return isset($client->email_verified) && releem_server_is_truthy($client->email_verified);
     }
 }
 
@@ -1190,7 +1218,7 @@ if (!function_exists('releem_server_may_reveal_public_api_key')) {
             return false;
         }
 
-        $client = Capsule::table('tblclients')->where('id', (int) $service->userid)->select('email_verified')->first();
+        $client = Capsule::table('tblclients')->where('id', (int) $service->userid)->first();
 
         return releem_server_client_email_is_verified($client);
     }
@@ -2272,6 +2300,33 @@ if (!function_exists('releem_server_is_non_recurring_cycle')) {
     function releem_server_is_non_recurring_cycle($billingCycle)
     {
         return in_array(strtolower(trim((string) $billingCycle)), ['free account', 'free', 'one time', 'onetime'], true);
+    }
+}
+
+if (!function_exists('releem_server_get_service_valid_to')) {
+    /**
+     * Shared subscription window calculation for provisioning and daily reconciliation.
+     */
+    function releem_server_get_service_valid_to($service, array $params = [], $includeNonRecurring = true)
+    {
+        $dueDate = releem_server_get_param($params, 'nextduedate');
+        $validTo = releem_server_format_service_datetime(
+            $dueDate !== '' ? $dueDate : (isset($service->nextduedate) ? $service->nextduedate : ''),
+            true
+        );
+        if ($validTo !== '' || !$includeNonRecurring
+            || !releem_server_is_non_recurring_cycle(isset($service->billingcycle) ? $service->billingcycle : '')) {
+            return $validTo;
+        }
+
+        $regDate = releem_server_get_param($params, 'regdate');
+        $startedAt = releem_server_format_service_datetime(
+            $regDate !== '' ? $regDate : (isset($service->regdate) ? $service->regdate : ''),
+            false
+        );
+
+        // A missing registration date cannot define a stable non-recurring window; sync reports it as invalid.
+        return $startedAt !== '' ? releem_server_non_recurring_valid_to($startedAt) : '';
     }
 }
 
