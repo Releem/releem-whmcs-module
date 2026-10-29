@@ -32,6 +32,7 @@ namespace {
             $this->filters[] = [preg_replace('/^.*\./', '', $key), $operator, $value];
             return $this;
         }
+        public function whereNotNull($key) { return $this->where($key, '!=', null); }
         public function orderBy(...$args) { return $this; }
         public function select(...$args) { return $this; }
         public function first()
@@ -152,6 +153,33 @@ namespace {
     $params['serverpassword'] = 'plain.token-1';
     regressionCheck(releem_TestConnection($params)['success'], 'Test Connection must still accept an unsaved plain-text token');
     ReleemServerApi::setTransport(null);
+
+    foreach (['Suspended', 'Cancelled', 'Terminated'] as $siblingStatus) {
+        $params = lifecycleFixture(1, 42, true);
+        unset($GLOBALS['regressionMeta'][1]);
+        $GLOBALS['regressionRows']['tblhosting'][1]['domainstatus'] = $siblingStatus;
+        regressionCheck(releem_server_sync_service_unlocked($params, 'Cancelled') === 'success'
+            && count($GLOBALS['regressionCalls']) === 0
+            && !isset($GLOBALS['regressionMeta'][1]), 'An unlinked service must not adopt or update a ' . $siblingStatus . ' sibling on delete');
+    }
+
+    foreach (['Free Account', 'One Time'] as $cycle) {
+        $params = lifecycleFixture(1, 42, false);
+        $GLOBALS['regressionRows']['tblhosting'][0]['billingcycle'] = $cycle;
+        $GLOBALS['regressionRows']['tblhosting'][0]['nextduedate'] = '0000-00-00';
+        regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success'
+            && $GLOBALS['regressionCalls'][0]['payload']['subscription']['valid_to'] === '2036-10-01T23:59:59Z',
+            'Sync must use the same stable registration-based window as reconcile for ' . $cycle);
+        $params['regdate'] = '2026-12-01';
+        regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success'
+            && $GLOBALS['regressionCalls'][1]['payload']['subscription']['valid_to'] === '2036-12-01T23:59:59Z',
+            'An explicit registration date must override the stored date for ' . $cycle);
+        unset($params['regdate']);
+        $GLOBALS['regressionRows']['tblhosting'][0]['regdate'] = '0000-00-00';
+        $GLOBALS['regressionCalls'] = [];
+        regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'Service registration date is missing or invalid'
+            && count($GLOBALS['regressionCalls']) === 0, 'A missing registration date must not create a moving window');
+    }
 
     if ($failures) {
         fwrite(STDERR, implode("\n", $failures) . "\n");

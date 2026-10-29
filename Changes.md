@@ -38,6 +38,15 @@ Security and reliability release following a full code audit. No Releem API cont
 
 ### Fixed
 
+- Ending an unlinked service no longer reuses a customer linked to a sibling service. It returns success without
+  calling the Releem API or creating a new customer link.
+- Email adoption and adopted-customer API key visibility now use the WHMCS 8 account owner's verification status,
+  and require the owner's verified email to match the client email used for adoption. The legacy client flag is
+  used only on WHMCS versions without separate user accounts.
+- Daily reconciliation uses the same registration-based `valid_to` calculation as provisioning for Free and One Time
+  services, so an incorrect subscription window is corrected without repeated syncs once it matches.
+- Legacy API endpoint validation now rejects malformed DNS hostnames and non-root URL paths, and rebuilds a canonical
+  HTTPS origin from the validated hostname and port instead of retaining the original URL.
 - Suspending or terminating the subscription-owning service now sends `deleted` even when a higher-ID Active
   duplicate exists. Only a lower-ID service with a confirmed active Releem link can suppress deactivation;
   unprovisioned duplicates no longer leave a subscription active.

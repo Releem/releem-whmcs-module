@@ -27,7 +27,7 @@ From this repository, copy the whole `modules/` tree into the WHMCS installation
 
 In WHMCS, go to `Configuration -> System Settings -> Addon Modules`, find `Releem Setup`, and activate it. Grant access to the administrator roles that should be able to configure products. Product Setup additionally requires the `Edit Products/Services` admin permission.
 
-The addon has one setting, **Link existing Releem customers by email** (off by default). With it off, an existing Releem customer is only linked to a WHMCS client whose email is verified in WHMCS. Enable it only if you trust your clients' email addresses.
+The addon has one setting, **Link existing Releem customers by email** (off by default). With it off, an existing Releem customer is only linked to a WHMCS client whose email is verified in WHMCS. On WHMCS 8, the account owner's verified user email must match the client's email used for linking. A verified user with a different email does not qualify. Enable the setting only if you trust your clients' email addresses; it does not bypass verification when displaying an adopted customer's public API key.
 
 Keep the addon active: deactivating it stops the renewal and daily reconcile hooks.
 
