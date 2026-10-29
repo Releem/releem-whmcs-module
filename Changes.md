@@ -3,6 +3,58 @@
 All notable changes to the Releem WHMCS module. The `Releem Setup` addon version (shown in
 `Addons -> Releem Setup`) is the module release number. Releases before 1.3.1 were not tracked here.
 
+## 1.3.2 - 2026-10-29
+
+Security and reliability fixes since 1.3.1. No Releem API contract changes.
+
+### Security
+
+- Email adoption and adopted-customer API key visibility use the WHMCS 8 account owner's verification status and
+  require the verified user email to match the client email. The legacy client verification flag is used only on
+  WHMCS versions without separate user accounts.
+- Adopted customers retain a hash of the original matched email. Changing the profile to a different verified email
+  never reveals the original customer's key, including when reusing that customer for a sibling service.
+- The public API key is cached in an admin-only custom field and displayed only after the original adoption email
+  is verified. Verification makes it available immediately without another sync. Missing customer metadata or
+  adoption provenance denies access. Adoption stops if its identity cannot be saved before caching the key.
+- Provisioning reads the partner token from the server record with strict decryption. An undecryptable
+  `serverpassword` parameter is not sent as the token. Test Connection still accepts an unsaved plain-text token.
+- Legacy API endpoints now reject malformed DNS hostnames and non-root paths, and are rebuilt as canonical HTTPS
+  origins from validated hostnames and ports.
+
+### Fixed
+
+- A successfully provisioned active service keeps ownership regardless of service ID. A later lower-ID service
+  cannot take over its subscription, and unprovisioned duplicates cannot block its sync or reconciliation.
+- A previously provisioned owner retains priority after suspension, so an unprovisioned lower-ID duplicate cannot
+  block unsuspend or restoration. A different live provisioned owner still takes priority over a former owner.
+- Suspending or terminating the owner sends `deleted` despite unprovisioned Active duplicates. Ending a duplicate
+  preserves the provisioned owner's subscription. Ending an unlinked service never adopts a sibling's customer.
+- Daily reconciliation calculates Free and One Time `valid_to` from the registration date in the same way as sync.
+  It performs ownership queries only after detecting status, billing-window or server-count drift.
+- Sync stops if the MySQL client lock is unavailable, instead of running without serialization. Acquired locks are
+  released after both successful and failed syncs.
+- The adoption error uses the exact addon setting name: **Link existing Releem customers by email**.
+
+### Added
+
+- README procedure for an administrator to restore adopted-key access after independently confirming customer
+  ownership, including a guarded update of the approved email hash and recovery of an empty key cache.
+- `mod_releem_service_meta.adopted_email_hash`, added automatically on first use, stores the original adoption
+  identity without keeping the email itself in metadata.
+- Regression coverage for service ownership and lifecycle changes, client locking, reconciliation windows, WHMCS 8
+  verification, adoption provenance, key visibility and caching, and endpoint validation.
+
+### Upgrade notes
+
+1. Copy the whole `modules/` tree over the existing install. The Releem Setup addon now reports **1.3.2**.
+2. The metadata table gains `adopted_email_hash` automatically on first use; the WHMCS database user needs permission
+   to alter that table.
+3. Existing adopted rows without the original email hash keep their keys hidden. The module deliberately does not
+   infer adoption provenance from the current profile email.
+4. The WHMCS database connection must support the MySQL named lock used by the module. If acquiring the lock fails,
+   sync stops and records the error in the Module Log.
+
 ## 1.3.1 - 2026-10-25
 
 Security and reliability release following a full code audit. No Releem API contract changes.
@@ -17,10 +69,7 @@ Security and reliability release following a full code audit. No Releem API cont
 - Ending a subscription (suspend, cancel, terminate) never looks a customer up by email. It only acts on a customer the
   service was already linked to.
 - Customers that were linked by email are flagged `adopted` in `mod_releem_service_meta`; the module never sends a
-  `name` update for them.
-- The public API key of an adopted customer is stored and shown only after the client email is verified in WHMCS.
-  Turning on **Link existing Releem customers by email** can still attach the subscription, but it does not reveal
-  the key while the email is unverified.
+  `name` update for them. Customers linked before this release are not flagged.
 - **Partner API token is only sent to Releem.** The server hostname (and the legacy product endpoint) must be
   `releem.com` or a subdomain such as `api2.releem.com` or `api2.dev.releem.com`. IP addresses, `localhost` and foreign
   hosts are refused. A trailing dot in the hostname is accepted.
@@ -33,31 +82,9 @@ Security and reliability release following a full code audit. No Releem API cont
   and similar are redacted, and email addresses inside free text become `[EMAIL]`). The duplicate-customer error no
   longer includes the email.
 - Generated install commands use `curl -fsSL --proto '=https' --tlsv1.2`, so an HTTP error page is never executed as
-  root and the download cannot fall back to plain HTTP. The Windows command forces TLS 1.2 and an `https://` installer
-  URL before `Invoke-WebRequest`. Removed the unused `releem_server_build_whm_install_command`.
+  root and the download cannot fall back to plain HTTP. Removed the unused `releem_server_build_whm_install_command`.
 
 ### Fixed
-
-- A successfully provisioned active service keeps ownership of the client's Releem subscription regardless of ID.
-  A later lower-ID service cannot overwrite it, and unprovisioned duplicates cannot block the owner's reconciliation.
-- The adoption error now names the addon setting exactly: **Link existing Releem customers by email**.
-- Sync now stops when the MySQL client lock is unavailable instead of running without serialization. Acquired locks
-  are still released after either a successful or failed sync.
-- Ending an unlinked service no longer reuses a customer linked to a sibling service. It returns success without
-  calling the Releem API or creating a new customer link.
-- Email adoption and adopted-customer API key visibility now use the WHMCS 8 account owner's verification status,
-  and require the owner's verified email to match the client email used for adoption. The legacy client flag is
-  used only on WHMCS versions without separate user accounts.
-- Daily reconciliation uses the same registration-based `valid_to` calculation as provisioning for Free and One Time
-  services, so an incorrect subscription window is corrected without repeated syncs once it matches.
-- Legacy API endpoint validation now rejects malformed DNS hostnames and non-root URL paths, and rebuilds a canonical
-  HTTPS origin from the validated hostname and port instead of retaining the original URL.
-- Suspending or terminating the subscription-owning service now sends `deleted` even when another Active duplicate
-  exists. Ending a duplicate preserves the provisioned owner's subscription regardless of ID;
-  unprovisioned duplicates no longer leave a subscription active.
-- Provisioning now reads the partner token from the assigned server record with strict decryption. An undecryptable
-  `serverpassword` parameter is rejected instead of being sent as the token. The administrator's Test Connection
-  action still accepts an unsaved plain-text token.
 
 - **Subscription ID is always the WHMCS service ID.** Numeric gateway `subscriptionid` values are no longer used: they
   live in another number space and could equal an unrelated service's ID. Subscription IDs already sent to Releem keep
@@ -69,7 +96,7 @@ Security and reliability release following a full code audit. No Releem API cont
   match is refused instead of being read as "customer does not exist", in case the list endpoint is paginated.
 - The per-client sync lock name is now scoped by database, so several WHMCS installs sharing one MySQL server no longer
   block each other.
-- The daily reconcile skips active duplicates that do not own the client's provisioned subscription, instead of
+- The daily reconcile skips active services that lost to a lower-ID active service of the same client, instead of
   retrying them every day and using up its run limit.
 - `Setup Product` now also creates zero-price `tblpricing` rows (every currency) for the `Servers` option values 1-10.
   Existing priced rows are never changed.
