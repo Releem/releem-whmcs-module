@@ -181,6 +181,36 @@ namespace {
             && count($GLOBALS['regressionCalls']) === 0, 'A missing registration date must not create a moving window');
     }
 
+    // The first successfully provisioned service owns the subscription, regardless of ID order.
+    $params = lifecycleFixture(42, 1, false);
+    $GLOBALS['regressionRows']['tblhosting'][1]['domainstatus'] = 'Pending';
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success', 'Provision the higher-ID service first');
+    $params['serviceid'] = 1;
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') !== 'success'
+        && count($GLOBALS['regressionCalls']) === 1, 'A later lower-ID service must not take over the provisioned owner');
+    $GLOBALS['regressionRows']['tblhosting'][1]['domainstatus'] = 'Active';
+    $params['serviceid'] = 42;
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') === 'success', 'An unprovisioned lower-ID Active duplicate must not block its owner');
+    $params['serviceid'] = 1;
+    $GLOBALS['regressionCalls'] = [];
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Suspended') === 'success'
+        && count($GLOBALS['regressionCalls']) === 0, 'Ending a lower-ID duplicate must preserve the higher-ID owner');
+
+    $params = lifecycleFixture(42, 1, false);
+    $GLOBALS['regressionMeta'] = [];
+    regressionCheck(releem_server_sync_service_unlocked($params, 'Active') !== 'success'
+        && count($GLOBALS['regressionCalls']) === 0, 'Unprovisioned Active services must still choose one candidate deterministically');
+
+    $params = lifecycleFixture(1, 42, false);
+    $GLOBALS['regressionMeta'] = [];
+    $GLOBALS['regressionRows']['tblhosting'][1]['domainstatus'] = 'Suspended';
+    ReleemServerApi::setTransport(function () {
+        return ['status'=>200, 'body'=>json_encode([['id'=>'existing-customer', 'email'=>'test@example.invalid']])];
+    });
+    regressionCheck(strpos(releem_server_sync_service_unlocked($params, 'Active'),
+        'enable "Link existing Releem customers by email"') !== false, 'Adoption error must use the exact addon setting label');
+    ReleemServerApi::setTransport(null);
+
     if ($failures) {
         fwrite(STDERR, implode("\n", $failures) . "\n");
         exit(1);

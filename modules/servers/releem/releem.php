@@ -471,8 +471,7 @@ if (!function_exists('releem_server_with_client_lock')) {
             $row = Capsule::select('SELECT GET_LOCK(?, 15) AS acquired', [$lockName]);
             $acquired = !empty($row) && (int) $row[0]->acquired === 1;
         } catch (\Throwable $e) {
-            // Locking unavailable (non-MySQL driver): continue unlocked rather than blocking provisioning.
-            return $callback();
+            throw new Exception('Unable to acquire the Releem client sync lock; try again shortly', 0, $e);
         }
 
         if (!$acquired) {
@@ -573,20 +572,20 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
             $name = $company !== '' ? $company : ($fullName !== '' ? $fullName : $email);
 
             // One Releem subscription exists per Releem customer, so only one active service per client may own it.
-            $otherActiveServiceId = releem_server_find_other_active_service_id($serviceId, $clientId, $isDelete);
-            if ($otherActiveServiceId > 0) {
-                if ($isDelete && $otherActiveServiceId < $serviceId) {
+            $ownerId = releem_server_find_subscription_owner_id($serviceId, $clientId, $meta);
+            if ($ownerId !== $serviceId) {
+                if ($isDelete) {
                     releem_server_log(
                         'sync',
                         ['serviceid' => $serviceId],
-                        'Skipped status change: subscription belongs to active Releem service #' . $otherActiveServiceId
+                        'Skipped status change: subscription belongs to active Releem service #' . $ownerId
                     );
                     releem_server_set_service_meta($serviceId, ['status' => $releemStatus]);
                     return 'success';
                 }
 
-                if (!$isDelete && $otherActiveServiceId < $serviceId) {
-                    $message = 'Client already has an active Releem service (#' . $otherActiveServiceId
+                if (!$isDelete) {
+                    $message = 'Client already has an active Releem service (#' . $ownerId
                         . '); only one Releem service per client is supported';
                     releem_server_log('sync', ['serviceid' => $serviceId], $message);
                     return $message;
@@ -692,7 +691,7 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
                 if (is_array($existingCustomer) && !empty($existingCustomer['id'])) {
                     if (!releem_server_adoption_allowed($client)) {
                         $message = 'A Releem customer already exists for this client email, but the email is not verified in WHMCS; '
-                            . 'verify the email or enable "Allow linking existing Releem customers by email" in Releem Setup';
+                            . 'verify the email or enable "Link existing Releem customers by email" in Releem Setup';
                         releem_server_log('sync', ['serviceid' => $serviceId], $message);
                         return $message;
                     }
@@ -816,6 +815,27 @@ if (!function_exists('releem_server_find_other_active_service_id')) {
             ->first();
 
         return ($row && isset($row->id)) ? (int) $row->id : 0;
+    }
+}
+
+if (!function_exists('releem_server_find_subscription_owner_id')) {
+    /**
+     * A successfully synced active service keeps ownership even if a lower-ID service activates later.
+     * Lowest ID is only the tie-breaker for unprovisioned services or conflicting existing active links.
+     */
+    function releem_server_find_subscription_owner_id($serviceId, $clientId, array $meta)
+    {
+        $otherOwnerId = releem_server_find_other_active_service_id($serviceId, $clientId, true);
+        $ownsSubscription = !empty($meta['customer_id']) && isset($meta['status']) && $meta['status'] === 'active';
+        if ($ownsSubscription) {
+            return $otherOwnerId > 0 ? min((int) $serviceId, $otherOwnerId) : (int) $serviceId;
+        }
+        if ($otherOwnerId > 0) {
+            return $otherOwnerId;
+        }
+
+        $otherActiveId = releem_server_find_other_active_service_id($serviceId, $clientId);
+        return $otherActiveId > 0 ? min((int) $serviceId, $otherActiveId) : (int) $serviceId;
     }
 }
 
@@ -1051,7 +1071,7 @@ if (!function_exists('releem_server_reconcile_all')) {
                 // Least recently attempted first, so rows that never converge cannot starve the others.
                 ->orderBy('m.updated_at', 'asc')
                 ->orderBy('h.id', 'asc')
-                ->select('h.id', 'h.userid', 'h.packageid', 'h.domainstatus', 'h.nextduedate', 'h.billingcycle', 'h.regdate', 'm.status as meta_status', 'm.valid_to as meta_valid_to', 'm.number_servers as meta_servers')
+                ->select('h.id', 'h.userid', 'h.packageid', 'h.domainstatus', 'h.nextduedate', 'h.billingcycle', 'h.regdate', 'm.customer_id as meta_customer_id', 'm.status as meta_status', 'm.valid_to as meta_valid_to', 'm.number_servers as meta_servers')
                 ->get();
 
             $optionIds = [];
@@ -1062,11 +1082,13 @@ if (!function_exists('releem_server_reconcile_all')) {
 
                 $expectedStatus = releem_server_map_status($row->domainstatus);
 
-                // An active service that lost to a lower-ID active service of the same client can never sync; retrying
-                // it every day only burns the run limit and API calls.
+                // Skip duplicates while allowing the provisioned owner to reconcile regardless of its service ID.
                 if ($expectedStatus === 'active') {
-                    $ownerId = releem_server_find_other_active_service_id((int) $row->id, (int) $row->userid);
-                    if ($ownerId > 0 && $ownerId < (int) $row->id) {
+                    $ownerId = releem_server_find_subscription_owner_id((int) $row->id, (int) $row->userid, [
+                        'customer_id' => $row->meta_customer_id,
+                        'status' => $row->meta_status,
+                    ]);
+                    if ($ownerId !== (int) $row->id) {
                         continue;
                     }
                 }
