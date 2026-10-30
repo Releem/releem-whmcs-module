@@ -57,6 +57,7 @@
 #releem-app .rl-control:focus { outline: 0; border-color: var(--rl-accent); }
 
 /* tables */
+#releem-app .rl-table-scroll { width: 100%; overflow-x: auto; }
 #releem-app .rl-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--rl-line); }
 #releem-app .rl-toolbar label { display: inline-flex; align-items: center; gap: 8px; margin: 0; font-weight: 400; }
 #releem-app .rl-toolbar__spacer { flex: 1; }

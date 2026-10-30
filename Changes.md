@@ -3,6 +3,29 @@
 All notable changes to the Releem WHMCS module. The `Releem Setup` addon version (shown in
 `Addons -> Releem Setup`) is the module release number. Releases before 1.3.1 were not tracked here.
 
+## 1.3.3 - 2026-10-30
+
+### Security
+
+- API error bodies are redacted before truncation, including escaped JSON keys/values, so cutting an error cannot
+  leave most of a partner token or public API key in the Module Log. Non-JSON error bodies are omitted; the HTTP
+  status remains available for diagnosis.
+- Empty or invalid customer lookup responses no longer count as proof that a customer is absent. Valid empty lists,
+  exact matches and empty successful PATCH responses remain supported.
+
+### Fixed
+
+- The installation wizard rejects memory limits that cannot be represented as safe whole numbers.
+- Support links stay within 2000 characters after Unicode encoding and show a notice when the message is shortened.
+- Windows commands clear a previously enabled query-optimization environment variable when optimization is disabled.
+- The Services table scrolls within its container on narrow screens.
+- The server form preserves original labels, row visibility, tooltips and placeholders, and adapts when WHMCS
+  replaces the table or module selector dynamically.
+
+### Added
+
+- API response safety tests and dependency-free browser regressions for the wizard and server form.
+
 ## 1.3.2 - 2026-10-29
 
 Security and reliability fixes since 1.3.1. No Releem API contract changes.

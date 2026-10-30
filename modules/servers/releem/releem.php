@@ -153,17 +153,17 @@ if (!class_exists('ReleemServerApi')) {
             // Only a plain list of customer objects is understood. Wrapped, paginated or otherwise unexpected shapes
             // must never be read as "customer does not exist": that would create duplicate customers.
             foreach ($response as $position => $customer) {
-                if (!is_int($position) || !is_array($customer) || !isset($customer['email']) || !isset($customer['id'])) {
+                if (!is_int($position) || !is_array($customer)
+                    || !isset($customer['email'], $customer['id'])
+                    || !is_string($customer['email']) || trim($customer['email']) === ''
+                    || !(is_string($customer['id']) || is_int($customer['id']))
+                    || empty($customer['id']) || trim((string) $customer['id']) === '') {
                     throw new Exception('Unexpected customer lookup response shape');
                 }
             }
 
             $matches = [];
             foreach ($response as $customer) {
-                if (empty($customer['email']) || empty($customer['id'])) {
-                    continue;
-                }
-
                 if (strcasecmp(trim((string) $customer['email']), trim((string) $email)) === 0) {
                     $matches[] = $customer;
                 }
@@ -211,12 +211,25 @@ if (!class_exists('ReleemServerApi')) {
             $response = (string) $result['body'];
 
             if ($httpCode < 200 || $httpCode >= 300) {
+                // Scrub the complete body before truncation can split a secret or its JSON value.
+                $error = json_decode($response, true);
+                // Malformed bodies cannot be safely decoded (including partially escaped secrets).
+                $safeResponse = is_array($error) ? releem_server_redact($response) : '[Non-JSON error body omitted]';
+                $encodedKey = json_encode($this->apiKey);
+                $safeResponse = str_replace(
+                    [$this->apiKey, substr($encodedKey, 1, -1)],
+                    '[REDACTED]',
+                    $safeResponse
+                );
                 throw new Exception(
-                    'Releem API Error: HTTP ' . $httpCode . ' - ' . substr($response, 0, self::MAX_ERROR_BODY)
+                    'Releem API Error: HTTP ' . $httpCode . ' - ' . substr($safeResponse, 0, self::MAX_ERROR_BODY)
                 );
             }
 
             if (trim($response) === '') {
+                if ($method === 'GET') {
+                    throw new Exception('Releem API returned an empty customer lookup response');
+                }
                 return [];
             }
 
@@ -228,6 +241,15 @@ if (!class_exists('ReleemServerApi')) {
             // A non-empty body must be a JSON object/array: scalars and null are never a valid Releem reply.
             if (!is_array($decoded)) {
                 throw new Exception('Releem API returned an unexpected JSON value (HTTP ' . $httpCode . ')');
+            }
+
+            // Associative decoding loses the difference between [] and {}, including numeric-key objects.
+            // Both GET callers query customers; retain the supported single-customer object compatibility.
+            if ($method === 'GET') {
+                $container = json_decode($response);
+                if (!is_array($container) && !(is_object($container) && (isset($container->id) || isset($container->email)))) {
+                    throw new Exception('Unexpected customer lookup response shape');
+                }
             }
 
             return $decoded;
@@ -2769,6 +2791,15 @@ if (!function_exists('releem_server_redact')) {
     function releem_server_redact($data)
     {
         if (is_string($data)) {
+            // Decode before masking: JSON keys and values can contain escaped quotes or Unicode escapes.
+            $decoded = json_decode($data, true);
+            if (is_array($decoded)) {
+                $encoded = json_encode(releem_server_redact($decoded), JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES);
+                if (is_string($encoded)) {
+                    return $encoded;
+                }
+            }
+
             foreach (releem_server_register_secret() as $secret) {
                 $data = str_replace($secret, '[REDACTED]', $data);
             }
@@ -2780,7 +2811,7 @@ if (!function_exists('releem_server_redact')) {
             }
 
             // API error bodies may echo key material.
-            $scrubbed = preg_replace('/("(?:[a-z_-]*(?:api[_-]?key|token|secret|password)[a-z_-]*)"\s*:\s*")[^"]*(")/i', '$1[REDACTED]$2', $data);
+            $scrubbed = preg_replace('/("(?:[a-z_-]*(?:api[_-]?key|token|secret|password)[a-z_-]*)"\s*:\s*)"(?:[^"\\\\]|\\\\.)*(?:"|$)/i', '$1"[REDACTED]"', $data);
 
             return is_string($scrubbed) ? $scrubbed : $data;
         }
