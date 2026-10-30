@@ -99,7 +99,7 @@ namespace {
         $GLOBALS['regressionCalls'] = [];
         ReleemServerApi::setTransport(function ($method, $url, $headers, $body) {
             $GLOBALS['regressionCalls'][] = ['method'=>$method, 'payload'=>json_decode($body ?? 'null', true)];
-            return ['status'=>200, 'body'=>'{}'];
+            return ['status'=>200, 'body'=>$method === 'GET' ? '[]' : '{}'];
         });
         return ['serviceid'=>$id, 'serverpassword'=>'plain.token-1', 'serverhostname'=>'api2.releem.com',
             'serversecure'=>'on', 'paymentmethodname'=>'Bank Transfer'];

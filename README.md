@@ -270,6 +270,27 @@ An administrator can approve the current address manually:
 - **`Releem sync failed. Check module log.`**
   - Action: open `Configuration -> System Logs -> Module Log`, inspect the matching `sync`, `createCustomer`, or `updateCustomer` entry, correct the reported API or WHMCS data issue, and retry the module action.
 
+## Automated regression tests
+
+Run each `tests/test_*.php` script with PHP 7.4 or later. They use synthetic transports and do not contact Releem or
+require a WHMCS installation. For example:
+
+```sh
+php tests/test_api_response_safety.php
+php tests/test_security_hardening.php
+```
+
+Browser regressions require Node.js 22 or later and Chrome/Chromium, without npm packages:
+
+```sh
+node tests/test_frontend.mjs
+# For another browser executable:
+CHROME_BIN=chromium node tests/test_frontend.mjs
+```
+
+These run the actual template/hook JavaScript in isolated desktop and mobile DOM fixtures. They make no API calls,
+execute no installer commands, and do not replace the manual verification of WHMCS billing and theme integration.
+
 ## Support
 
 - Email: `hello@releem.com`
