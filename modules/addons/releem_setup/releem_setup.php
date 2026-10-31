@@ -12,13 +12,13 @@ if (!function_exists('releem_setup_config')) {
         return [
             'name' => 'Releem Setup',
             'description' => 'Releem services dashboard, sales report and product setup for the Releem WHMCS module.',
-            'version' => '1.3.1',
+            'version' => '1.3.3',
             'author' => 'Releem',
             'fields' => [
                 'allow_email_adoption' => [
                     'FriendlyName' => 'Link existing Releem customers by email',
                     'Type' => 'yesno',
-                    'Description' => 'Allow a client to be linked to a Releem customer that already exists for the same email address even when the email is not verified in WHMCS. Leave off unless you trust the clients\' email addresses: anyone able to set a profile email could otherwise reach that customer\'s Releem API key.',
+                    'Description' => 'Allow a client to be linked to a Releem customer that already exists for the same email address even when the email is not verified in WHMCS. The public API key stays hidden until WHMCS verifies that email. Leave off unless you trust the clients\' email addresses: an unverified profile email can still be attached to that customer\'s subscription.',
                 ],
             ],
         ];
@@ -369,7 +369,7 @@ if (!function_exists('releem_setup_render_home')) {
             . '<label>Show <select class="rl-control" data-rl-length><option>10</option><option selected>25</option><option>50</option><option>100</option><option>200</option><option value="0">All</option></select></label>'
             . '<span class="rl-toolbar__spacer"></span>'
             . '<label>Search <input type="search" class="rl-control" data-rl-search placeholder="Search..."></label></div>';
-        $body .= '<table class="rl-table"><thead><tr>';
+        $body .= '<div class="rl-table-scroll"><table class="rl-table"><thead><tr>';
         foreach (['ID', 'Client', 'Product', 'Domain', 'Releem Customer ID', 'Servers', 'Valid Until', 'Status'] as $heading) {
             $body .= '<th class="rl-sortable">' . $heading . '</th>';
         }
@@ -391,7 +391,7 @@ if (!function_exists('releem_setup_render_home')) {
                 . '</tr>';
         }
         $body .= '<tr class="rl-empty-row"' . (count($rows) > 0 ? ' style="display:none"' : '') . '><td colspan="8">No Releem services found.</td></tr>';
-        $body .= '</tbody></table>';
+        $body .= '</tbody></table></div>';
         $body .= '<div class="rl-pager"><span data-rl-info></span><span class="rl-pager__buttons" data-rl-pages></span></div></div>';
 
         return releem_setup_widget('Releem Services', 'fa fa-list', $body, true);

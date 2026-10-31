@@ -49,8 +49,16 @@ if (!class_exists('ReleemServerApi')) {
          */
         public static function isAllowedHost($host)
         {
-            $host = strtolower(rtrim(trim((string) $host), '.'));
-            if ($host === '' || filter_var($host, FILTER_VALIDATE_IP) !== false || preg_match('/^[0-9.]+$/', $host)) {
+            $host = strtolower(trim((string) $host));
+            if (substr($host, -1) === '.') {
+                $host = substr($host, 0, -1);
+            }
+            if (
+                $host === ''
+                || filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) === false
+                || filter_var($host, FILTER_VALIDATE_IP) !== false
+                || preg_match('/^[0-9.]+$/', $host)
+            ) {
                 return false;
             }
 
@@ -79,12 +87,17 @@ if (!class_exists('ReleemServerApi')) {
                 || isset($parts['pass'])
                 || isset($parts['query'])
                 || isset($parts['fragment'])
+                || (isset($parts['path']) && !in_array($parts['path'], ['', '/'], true))
+                || (isset($parts['port']) && ($parts['port'] < 1 || $parts['port'] > 65535))
                 || preg_match('/\s/', $endpoint)
             ) {
                 throw new InvalidArgumentException('Releem API endpoint must be a valid https:// URL on a releem.com host');
             }
 
-            return rtrim($endpoint, '/');
+            $host = strtolower(rtrim($parts['host'], '.'));
+            $port = isset($parts['port']) ? (int) $parts['port'] : 443;
+
+            return 'https://' . $host . ($port === 443 ? '' : ':' . $port);
         }
 
         public function __construct($apiKey, $endpoint = self::DEFAULT_ENDPOINT)
@@ -140,17 +153,17 @@ if (!class_exists('ReleemServerApi')) {
             // Only a plain list of customer objects is understood. Wrapped, paginated or otherwise unexpected shapes
             // must never be read as "customer does not exist": that would create duplicate customers.
             foreach ($response as $position => $customer) {
-                if (!is_int($position) || !is_array($customer) || !isset($customer['email']) || !isset($customer['id'])) {
+                if (!is_int($position) || !is_array($customer)
+                    || !isset($customer['email'], $customer['id'])
+                    || !is_string($customer['email']) || trim($customer['email']) === ''
+                    || !(is_string($customer['id']) || is_int($customer['id']))
+                    || empty($customer['id']) || trim((string) $customer['id']) === '') {
                     throw new Exception('Unexpected customer lookup response shape');
                 }
             }
 
             $matches = [];
             foreach ($response as $customer) {
-                if (empty($customer['email']) || empty($customer['id'])) {
-                    continue;
-                }
-
                 if (strcasecmp(trim((string) $customer['email']), trim((string) $email)) === 0) {
                     $matches[] = $customer;
                 }
@@ -198,12 +211,25 @@ if (!class_exists('ReleemServerApi')) {
             $response = (string) $result['body'];
 
             if ($httpCode < 200 || $httpCode >= 300) {
+                // Scrub the complete body before truncation can split a secret or its JSON value.
+                $error = json_decode($response, true);
+                // Malformed bodies cannot be safely decoded (including partially escaped secrets).
+                $safeResponse = is_array($error) ? releem_server_redact($response) : '[Non-JSON error body omitted]';
+                $encodedKey = json_encode($this->apiKey);
+                $safeResponse = str_replace(
+                    [$this->apiKey, substr($encodedKey, 1, -1)],
+                    '[REDACTED]',
+                    $safeResponse
+                );
                 throw new Exception(
-                    'Releem API Error: HTTP ' . $httpCode . ' - ' . substr($response, 0, self::MAX_ERROR_BODY)
+                    'Releem API Error: HTTP ' . $httpCode . ' - ' . substr($safeResponse, 0, self::MAX_ERROR_BODY)
                 );
             }
 
             if (trim($response) === '') {
+                if ($method === 'GET') {
+                    throw new Exception('Releem API returned an empty customer lookup response');
+                }
                 return [];
             }
 
@@ -215,6 +241,15 @@ if (!class_exists('ReleemServerApi')) {
             // A non-empty body must be a JSON object/array: scalars and null are never a valid Releem reply.
             if (!is_array($decoded)) {
                 throw new Exception('Releem API returned an unexpected JSON value (HTTP ' . $httpCode . ')');
+            }
+
+            // Associative decoding loses the difference between [] and {}, including numeric-key objects.
+            // Both GET callers query customers; retain the supported single-customer object compatibility.
+            if ($method === 'GET') {
+                $container = json_decode($response);
+                if (!is_array($container) && !(is_object($container) && (isset($container->id) || isset($container->email)))) {
+                    throw new Exception('Unexpected customer lookup response shape');
+                }
             }
 
             return $decoded;
@@ -334,7 +369,8 @@ if (!function_exists('releem_TestConnection')) {
     function releem_TestConnection(array $params)
     {
         try {
-            $credentials = releem_server_resolve_credentials($params, (object) []);
+            // The server form can contain a new, unsaved plain-text token.
+            $credentials = releem_server_resolve_credentials($params, (object) [], true);
             if ($credentials['error'] !== '') {
                 return ['success' => false, 'error' => $credentials['error']];
             }
@@ -392,8 +428,9 @@ if (!function_exists('releem_ClientArea')) {
             $isActive = $service && strtolower((string) $service->domainstatus) === 'active';
         }
 
-        // Never hand out the key for suspended, cancelled or terminated services.
-        if ($isActive) {
+        // Never hand out the key for suspended, cancelled or terminated services, or for an
+        // adopted customer while the WHMCS email is still unverified.
+        if ($isActive && releem_server_may_reveal_public_api_key($serviceId)) {
             $publicApiKey = releem_server_get_product_custom_field_value($serviceId, $productId, 'releem_public_api_key');
         }
 
@@ -456,8 +493,7 @@ if (!function_exists('releem_server_with_client_lock')) {
             $row = Capsule::select('SELECT GET_LOCK(?, 15) AS acquired', [$lockName]);
             $acquired = !empty($row) && (int) $row[0]->acquired === 1;
         } catch (\Throwable $e) {
-            // Locking unavailable (non-MySQL driver): continue unlocked rather than blocking provisioning.
-            return $callback();
+            throw new Exception('Unable to acquire the Releem client sync lock; try again shortly', 0, $e);
         }
 
         if (!$acquired) {
@@ -558,20 +594,20 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
             $name = $company !== '' ? $company : ($fullName !== '' ? $fullName : $email);
 
             // One Releem subscription exists per Releem customer, so only one active service per client may own it.
-            $otherActiveServiceId = releem_server_find_other_active_service_id($serviceId, $clientId);
-            if ($otherActiveServiceId > 0) {
+            $ownerId = releem_server_find_subscription_owner_id($serviceId, $clientId, $meta);
+            if ($ownerId !== $serviceId) {
                 if ($isDelete) {
                     releem_server_log(
                         'sync',
                         ['serviceid' => $serviceId],
-                        'Skipped status change: client has another active Releem service #' . $otherActiveServiceId
+                        'Skipped status change: subscription belongs to active Releem service #' . $ownerId
                     );
                     releem_server_set_service_meta($serviceId, ['status' => $releemStatus]);
                     return 'success';
                 }
 
-                if ($otherActiveServiceId < $serviceId) {
-                    $message = 'Client already has an active Releem service (#' . $otherActiveServiceId
+                if (!$isDelete) {
+                    $message = 'Client already has an active Releem service (#' . $ownerId
                         . '); only one Releem service per client is supported';
                     releem_server_log('sync', ['serviceid' => $serviceId], $message);
                     return $message;
@@ -616,17 +652,7 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
                     : (isset($service->regdate) ? $service->regdate : ''),
                 false
             );
-            $validTo = releem_server_format_service_datetime(
-                releem_server_get_param($params, 'nextduedate') !== ''
-                    ? releem_server_get_param($params, 'nextduedate')
-                    : (isset($service->nextduedate) ? $service->nextduedate : ''),
-                true
-            );
-            // Free and One Time services have no next due date (0000-00-00). They never renew, so give the Releem
-            // subscription a long fixed window instead of rejecting the service.
-            if ($validTo === '' && !$isDelete && releem_server_is_non_recurring_cycle(isset($service->billingcycle) ? $service->billingcycle : '')) {
-                $validTo = releem_server_non_recurring_valid_to($startedAt);
-            }
+            $validTo = releem_server_get_service_valid_to($service, $params, !$isDelete);
             $amount = releem_server_get_service_amount($service, $params);
             $paymentMethod = releem_server_get_payment_method_label($params, $service);
 
@@ -667,16 +693,25 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
             // A customer that was found by email (not created by this module) belongs to someone whose ownership of
             // the email was never proven here. Its name is never overwritten.
             $isAdopted = !empty($meta['adopted']);
+            $adoptedEmailHash = isset($meta['adopted_email_hash']) ? (string) $meta['adopted_email_hash'] : '';
 
             $api = new ReleemServerApi($partnerApiKey, $apiEndpoint);
 
-            if ($existingCustomerId === '') {
+            if ($existingCustomerId === '' && !$isDelete) {
                 // Reuse the Releem customer already linked to another service of this client (survives email changes).
                 $linked = releem_server_find_client_customer($clientId, $serviceId);
                 if ($linked['customer_id'] !== '') {
                     $existingCustomerId = $linked['customer_id'];
                     $isAdopted = $linked['adopted'];
-                    releem_server_safe_meta_write($serviceId, ['customer_id' => $existingCustomerId, 'adopted' => $isAdopted ? 1 : 0]);
+                    $adoptedEmailHash = $linked['adopted_email_hash'];
+                    $saved = releem_server_safe_meta_write($serviceId, [
+                        'customer_id' => $existingCustomerId,
+                        'adopted' => $isAdopted ? 1 : 0,
+                        'adopted_email_hash' => $adoptedEmailHash,
+                    ]);
+                    if ($isAdopted && !$saved) {
+                        throw new Exception('Unable to save adopted customer identity; retry the sync');
+                    }
                 }
             }
 
@@ -687,15 +722,22 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
                 if (is_array($existingCustomer) && !empty($existingCustomer['id'])) {
                     if (!releem_server_adoption_allowed($client)) {
                         $message = 'A Releem customer already exists for this client email, but the email is not verified in WHMCS; '
-                            . 'verify the email or enable "Allow linking existing Releem customers by email" in Releem Setup';
+                            . 'verify the email or enable "Link existing Releem customers by email" in Releem Setup';
                         releem_server_log('sync', ['serviceid' => $serviceId], $message);
                         return $message;
                     }
 
                     $existingCustomerId = (string) $existingCustomer['id'];
                     $isAdopted = true;
-                    releem_server_safe_meta_write($serviceId, ['customer_id' => $existingCustomerId, 'adopted' => 1]);
-                    releem_server_store_customer_public_api_key($serviceId, $packageId, $existingCustomer);
+                    $adoptedEmailHash = releem_server_email_hash($email);
+                    if (!releem_server_safe_meta_write($serviceId, [
+                        'customer_id' => $existingCustomerId,
+                        'adopted' => 1,
+                        'adopted_email_hash' => $adoptedEmailHash,
+                    ])) {
+                        throw new Exception('Unable to save adopted customer identity; retry the sync');
+                    }
+                    releem_server_sync_public_api_key($serviceId, $packageId, $existingCustomer, true, $client);
                 }
             }
 
@@ -752,13 +794,14 @@ if (!function_exists('releem_server_sync_service_unlocked')) {
             releem_server_safe_meta_write($serviceId, [
                 'customer_id' => $existingCustomerId,
                 'adopted' => $isAdopted ? 1 : 0,
+                'adopted_email_hash' => $adoptedEmailHash,
                 'subscription_id' => $subscriptionId,
                 'number_servers' => $serverCount,
                 'status' => $releemStatus,
                 'valid_to' => $validTo,
             ]);
             try {
-                releem_server_store_customer_public_api_key($serviceId, $packageId, $response);
+                releem_server_sync_public_api_key($serviceId, $packageId, $response, $isAdopted, $client);
             } catch (\Throwable $e) {
                 releem_server_log('storePublicApiKey', ['serviceid' => $serviceId], $e->getMessage());
             }
@@ -786,20 +829,63 @@ if (!function_exists('releem_server_safe_meta_write')) {
 if (!function_exists('releem_server_find_other_active_service_id')) {
     /**
      * Lowest ID of another Active Releem service owned by the same client, or 0.
+     * Provisioned candidates have previously sent a subscription ID, including services awaiting restoration.
      */
-    function releem_server_find_other_active_service_id($serviceId, $clientId)
+    function releem_server_find_other_active_service_id($serviceId, $clientId, $provisionedOnly = false, $activeSubscriptionOnly = false)
     {
-        $row = Capsule::table('tblhosting as h')
+        $query = Capsule::table('tblhosting as h')
             ->join('tblproducts as p', 'p.id', '=', 'h.packageid')
             ->where('h.userid', (int) $clientId)
             ->where('h.id', '!=', (int) $serviceId)
             ->where('h.domainstatus', 'Active')
-            ->where('p.servertype', 'releem')
-            ->orderBy('h.id', 'asc')
+            ->where('p.servertype', 'releem');
+
+        if ($provisionedOnly) {
+            if (!releem_server_ensure_meta_table()) {
+                return 0;
+            }
+            $query->join('mod_releem_service_meta as m', 'm.service_id', '=', 'h.id')
+                ->where('m.customer_id', '!=', '')
+                ->where('m.subscription_id', '>', 0);
+            if ($activeSubscriptionOnly) {
+                $query->where('m.status', 'active');
+            }
+        }
+
+        $row = $query->orderBy('h.id', 'asc')
             ->select('h.id')
             ->first();
 
         return ($row && isset($row->id)) ? (int) $row->id : 0;
+    }
+}
+
+if (!function_exists('releem_server_find_subscription_owner_id')) {
+    /**
+     * A successfully synced service keeps ownership across suspension, even if a lower-ID service activates later.
+     * Lowest ID is only the tie-breaker for unprovisioned services or conflicting existing active links.
+     */
+    function releem_server_find_subscription_owner_id($serviceId, $clientId, array $meta)
+    {
+        $otherOwnerId = releem_server_find_other_active_service_id($serviceId, $clientId, true, true);
+        $ownsSubscription = !empty($meta['customer_id']) && !empty($meta['subscription_id']);
+        if ($ownsSubscription && isset($meta['status']) && $meta['status'] === 'active') {
+            return $otherOwnerId > 0 ? min((int) $serviceId, $otherOwnerId) : (int) $serviceId;
+        }
+        if ($otherOwnerId > 0) {
+            return $otherOwnerId;
+        }
+        if ($ownsSubscription) {
+            return (int) $serviceId;
+        }
+
+        $formerOwnerId = releem_server_find_other_active_service_id($serviceId, $clientId, true);
+        if ($formerOwnerId > 0) {
+            return $formerOwnerId;
+        }
+
+        $otherActiveId = releem_server_find_other_active_service_id($serviceId, $clientId);
+        return $otherActiveId > 0 ? min((int) $serviceId, $otherActiveId) : (int) $serviceId;
     }
 }
 
@@ -822,11 +908,7 @@ if (!function_exists('releem_server_adoption_allowed')) {
             // Treated as "not enabled".
         }
 
-        if (is_object($client) && isset($client->email_verified)) {
-            return releem_server_is_truthy($client->email_verified);
-        }
-
-        return false;
+        return releem_server_client_email_is_verified($client);
     }
 }
 
@@ -838,7 +920,7 @@ if (!function_exists('releem_server_find_client_customer')) {
      */
     function releem_server_find_client_customer($clientId, $serviceId)
     {
-        $none = ['customer_id' => '', 'adopted' => false];
+        $none = ['customer_id' => '', 'adopted' => false, 'adopted_email_hash' => ''];
         if (!releem_server_ensure_meta_table()) {
             return $none;
         }
@@ -850,14 +932,18 @@ if (!function_exists('releem_server_find_client_customer')) {
             ->whereNotNull('m.customer_id')
             ->where('m.customer_id', '!=', '')
             ->orderBy('h.id', 'desc')
-            ->select('m.customer_id', 'm.adopted')
+            ->select('m.customer_id', 'm.adopted', 'm.adopted_email_hash')
             ->first();
 
         if (!$row || !isset($row->customer_id)) {
             return $none;
         }
 
-        return ['customer_id' => (string) $row->customer_id, 'adopted' => !empty($row->adopted)];
+        return [
+            'customer_id' => (string) $row->customer_id,
+            'adopted' => !empty($row->adopted),
+            'adopted_email_hash' => isset($row->adopted_email_hash) ? (string) $row->adopted_email_hash : '',
+        ];
     }
 }
 
@@ -1039,7 +1125,7 @@ if (!function_exists('releem_server_reconcile_all')) {
                 // Least recently attempted first, so rows that never converge cannot starve the others.
                 ->orderBy('m.updated_at', 'asc')
                 ->orderBy('h.id', 'asc')
-                ->select('h.id', 'h.userid', 'h.packageid', 'h.domainstatus', 'h.nextduedate', 'm.status as meta_status', 'm.valid_to as meta_valid_to', 'm.number_servers as meta_servers')
+                ->select('h.id', 'h.userid', 'h.packageid', 'h.domainstatus', 'h.nextduedate', 'h.billingcycle', 'h.regdate', 'm.customer_id as meta_customer_id', 'm.subscription_id as meta_subscription_id', 'm.status as meta_status', 'm.valid_to as meta_valid_to', 'm.number_servers as meta_servers')
                 ->get();
 
             $optionIds = [];
@@ -1050,16 +1136,7 @@ if (!function_exists('releem_server_reconcile_all')) {
 
                 $expectedStatus = releem_server_map_status($row->domainstatus);
 
-                // An active service that lost to a lower-ID active service of the same client can never sync; retrying
-                // it every day only burns the run limit and API calls.
-                if ($expectedStatus === 'active') {
-                    $ownerId = releem_server_find_other_active_service_id((int) $row->id, (int) $row->userid);
-                    if ($ownerId > 0 && $ownerId < (int) $row->id) {
-                        continue;
-                    }
-                }
-
-                $expectedValidTo = releem_server_format_service_datetime($row->nextduedate, true);
+                $expectedValidTo = releem_server_get_service_valid_to($row);
                 $statusDiffers = (string) $row->meta_status !== $expectedStatus;
                 $validToDiffers = $expectedStatus === 'active'
                     && $expectedValidTo !== ''
@@ -1080,6 +1157,17 @@ if (!function_exists('releem_server_reconcile_all')) {
                 }
 
                 if ($statusDiffers || $validToDiffers || $serversDiffer) {
+                    // Ownership joins are only needed for services with actual drift.
+                    if ($expectedStatus === 'active') {
+                        $ownerId = releem_server_find_subscription_owner_id((int) $row->id, (int) $row->userid, [
+                            'customer_id' => $row->meta_customer_id,
+                            'subscription_id' => $row->meta_subscription_id,
+                            'status' => $row->meta_status,
+                        ]);
+                        if ($ownerId !== (int) $row->id) {
+                            continue;
+                        }
+                    }
                     $results[(int) $row->id] = releem_server_resync_service((int) $row->id);
 
                     if ($results[(int) $row->id] !== 'success') {
@@ -1153,6 +1241,96 @@ if (!function_exists('releem_server_store_customer_public_api_key')) {
     }
 }
 
+if (!function_exists('releem_server_client_email_is_verified')) {
+    function releem_server_client_email_is_verified($client)
+    {
+        if (!is_object($client) || empty($client->email)) {
+            return false;
+        }
+
+        // WHMCS 8 verifies the account owner's user email, which can differ from the client's billing email.
+        // A verified owner only proves ownership of the address actually used for adoption when both match.
+        if (class_exists('WHMCS\\User\\Client') && method_exists('WHMCS\\User\\Client', 'owner')) {
+            try {
+                if (empty($client->id)) {
+                    return false;
+                }
+                $model = \WHMCS\User\Client::find((int) $client->id);
+                if (!$model) {
+                    return false;
+                }
+                $owner = $model->owner();
+                $email = trim((string) $client->email);
+
+                return $owner
+                    && strcasecmp(trim((string) $owner->email), $email) === 0
+                    && strcasecmp(trim((string) $model->email), $email) === 0
+                    && $model->isEmailAddressVerified();
+            } catch (\Throwable $e) {
+                releem_server_log('emailVerification', ['clientid' => isset($client->id) ? (int) $client->id : 0], $e->getMessage());
+                return false;
+            }
+        }
+
+        // WHMCS 7 predates separate user accounts and keeps verification on the client itself.
+        return isset($client->email_verified) && releem_server_is_truthy($client->email_verified);
+    }
+}
+
+if (!function_exists('releem_server_email_hash')) {
+    function releem_server_email_hash($email)
+    {
+        $email = strtolower(trim((string) $email));
+        return $email !== '' ? hash('sha256', $email) : '';
+    }
+}
+
+if (!function_exists('releem_server_may_reveal_public_api_key')) {
+    /**
+     * An adopted customer belongs to an account this module did not create. Its public API key is shown only after
+     * WHMCS has verified the original adoption email, including when an admin allowed unverified email adoption.
+     */
+    function releem_server_may_reveal_public_api_key($serviceId)
+    {
+        $meta = releem_server_get_service_meta($serviceId);
+        if (empty($meta['customer_id']) || !array_key_exists('adopted', $meta)) {
+            return false;
+        }
+        if (empty($meta['adopted'])) {
+            return true;
+        }
+
+        $service = Capsule::table('tblhosting')->where('id', (int) $serviceId)->select('userid')->first();
+        if (!$service || empty($service->userid)) {
+            return false;
+        }
+
+        $client = Capsule::table('tblclients')->where('id', (int) $service->userid)->first();
+
+        $adoptedEmailHash = isset($meta['adopted_email_hash']) ? (string) $meta['adopted_email_hash'] : '';
+        return $client
+            && $adoptedEmailHash !== ''
+            && hash_equals($adoptedEmailHash, releem_server_email_hash($client->email))
+            && releem_server_client_email_is_verified($client);
+    }
+}
+
+if (!function_exists('releem_server_sync_public_api_key')) {
+    function releem_server_sync_public_api_key($serviceId, $productId, array $customer, $isAdopted, $client)
+    {
+        if ($isAdopted) {
+            $meta = releem_server_get_service_meta($serviceId);
+            if (empty($meta['adopted']) || empty($meta['customer_id']) || empty($meta['adopted_email_hash'])) {
+                return;
+            }
+        }
+
+        // This admin-only field is a server-side cache. Visibility requires verification of the original adoption
+        // email, so its verification can reveal the cached key immediately without another provisioning action.
+        releem_server_store_customer_public_api_key($serviceId, $productId, $customer);
+    }
+}
+
 if (!function_exists('releem_server_get_customer_id')) {
     function releem_server_get_customer_id($serviceId, $productId)
     {
@@ -1186,7 +1364,7 @@ if (!function_exists('releem_server_get_service_meta')) {
 
         $row = Capsule::table('mod_releem_service_meta')
             ->where('service_id', $serviceId)
-            ->select('customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status', 'valid_to', 'adopted')
+            ->select('customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status', 'valid_to', 'adopted', 'adopted_email_hash')
             ->first();
 
         if (!$row) {
@@ -1201,6 +1379,7 @@ if (!function_exists('releem_server_get_service_meta')) {
             'status' => isset($row->status) ? (string) $row->status : '',
             'valid_to' => isset($row->valid_to) ? (string) $row->valid_to : '',
             'adopted' => !empty($row->adopted) ? '1' : '',
+            'adopted_email_hash' => isset($row->adopted_email_hash) ? (string) $row->adopted_email_hash : '',
         ];
     }
 }
@@ -1213,7 +1392,7 @@ if (!function_exists('releem_server_set_service_meta')) {
             return false;
         }
 
-        $allowedKeys = ['customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status', 'valid_to', 'adopted'];
+        $allowedKeys = ['customer_id', 'plan_id', 'subscription_id', 'number_servers', 'status', 'valid_to', 'adopted', 'adopted_email_hash'];
         $data = [];
         foreach ($allowedKeys as $key) {
             if (array_key_exists($key, $values)) {
@@ -1282,6 +1461,7 @@ if (!function_exists('releem_server_ensure_meta_table')) {
                     $table->string('status', 50)->nullable();
                     $table->string('valid_to', 40)->nullable();
                     $table->boolean('adopted')->default(0);
+                    $table->string('adopted_email_hash', 64)->nullable();
                     $table->timestamp('updated_at')->nullable();
                     $table->primary('service_id');
                 });
@@ -1313,6 +1493,11 @@ if (!function_exists('releem_server_ensure_meta_table')) {
                 if (!$schema->hasColumn('mod_releem_service_meta', 'adopted')) {
                     $schema->table('mod_releem_service_meta', function ($table) {
                         $table->boolean('adopted')->default(0)->after('valid_to');
+                    });
+                }
+                if (!$schema->hasColumn('mod_releem_service_meta', 'adopted_email_hash')) {
+                    $schema->table('mod_releem_service_meta', function ($table) {
+                        $table->string('adopted_email_hash', 64)->nullable()->after('adopted');
                     });
                 }
             }
@@ -1365,13 +1550,16 @@ if (!function_exists('releem_server_decrypt_secret')) {
     function releem_server_decrypt_secret($raw, $mustBeEncrypted = false)
     {
         $raw = trim((string) $raw);
-        if ($raw === '' || !function_exists('decrypt')) {
+        if ($raw === '') {
             return $raw;
         }
 
         // A value read straight from the database is always encrypted by WHMCS. If it cannot be decrypted (changed
         // encryption hash, corrupted value) the ciphertext must never be sent to Releem as if it were the token.
         $fallback = $mustBeEncrypted ? '' : $raw;
+        if (!function_exists('decrypt')) {
+            return $fallback;
+        }
 
         try {
             $decrypted = decrypt($raw);
@@ -1492,15 +1680,20 @@ if (!function_exists('releem_server_resolve_credentials')) {
      *
      * @return array ['key' => string, 'endpoint' => string, 'error' => string]
      */
-    function releem_server_resolve_credentials(array $params, $service)
+    function releem_server_resolve_credentials(array $params, $service, $allowPlaintextPassword = false)
     {
-        $key = releem_server_decrypt_secret(releem_server_get_param($params, 'serverpassword'));
+        // Provisioning trusts the encrypted server record, not an ambiguous printable parameter that may be ciphertext.
+        // Only Test Connection accepts a raw token from the unsaved administrator form.
+        $record = $allowPlaintextPassword ? null : releem_server_load_server_record($service);
+        $key = releem_server_decrypt_secret(releem_server_get_param($params, 'serverpassword'), !$allowPlaintextPassword);
         $host = releem_server_get_param($params, 'serverhostname');
         $port = releem_server_get_param($params, 'serverport');
         $secure = releem_server_get_param($params, 'serversecure');
 
-        if ($key === '' || $host === '') {
-            $record = releem_server_load_server_record($service);
+        if ($record || $key === '' || $host === '') {
+            if (!$record) {
+                $record = releem_server_load_server_record($service);
+            }
             if ($record) {
                 $key = releem_server_decrypt_secret(isset($record->password) ? $record->password : '', true);
                 $host = trim((string) (isset($record->hostname) && trim((string) $record->hostname) !== '' ? $record->hostname : (isset($record->ipaddress) ? $record->ipaddress : '')));
@@ -2212,6 +2405,33 @@ if (!function_exists('releem_server_is_non_recurring_cycle')) {
     }
 }
 
+if (!function_exists('releem_server_get_service_valid_to')) {
+    /**
+     * Shared subscription window calculation for provisioning and daily reconciliation.
+     */
+    function releem_server_get_service_valid_to($service, array $params = [], $includeNonRecurring = true)
+    {
+        $dueDate = releem_server_get_param($params, 'nextduedate');
+        $validTo = releem_server_format_service_datetime(
+            $dueDate !== '' ? $dueDate : (isset($service->nextduedate) ? $service->nextduedate : ''),
+            true
+        );
+        if ($validTo !== '' || !$includeNonRecurring
+            || !releem_server_is_non_recurring_cycle(isset($service->billingcycle) ? $service->billingcycle : '')) {
+            return $validTo;
+        }
+
+        $regDate = releem_server_get_param($params, 'regdate');
+        $startedAt = releem_server_format_service_datetime(
+            $regDate !== '' ? $regDate : (isset($service->regdate) ? $service->regdate : ''),
+            false
+        );
+
+        // A missing registration date cannot define a stable non-recurring window; sync reports it as invalid.
+        return $startedAt !== '' ? releem_server_non_recurring_valid_to($startedAt) : '';
+    }
+}
+
 if (!function_exists('releem_server_non_recurring_valid_to')) {
     /**
      * Subscription end for services that never renew: ten years after the start date (or today when unknown).
@@ -2571,6 +2791,15 @@ if (!function_exists('releem_server_redact')) {
     function releem_server_redact($data)
     {
         if (is_string($data)) {
+            // Decode before masking: JSON keys and values can contain escaped quotes or Unicode escapes.
+            $decoded = json_decode($data, true);
+            if (is_array($decoded)) {
+                $encoded = json_encode(releem_server_redact($decoded), JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES);
+                if (is_string($encoded)) {
+                    return $encoded;
+                }
+            }
+
             foreach (releem_server_register_secret() as $secret) {
                 $data = str_replace($secret, '[REDACTED]', $data);
             }
@@ -2582,7 +2811,7 @@ if (!function_exists('releem_server_redact')) {
             }
 
             // API error bodies may echo key material.
-            $scrubbed = preg_replace('/("(?:[a-z_-]*(?:api[_-]?key|token|secret|password)[a-z_-]*)"\s*:\s*")[^"]*(")/i', '$1[REDACTED]$2', $data);
+            $scrubbed = preg_replace('/("(?:[a-z_-]*(?:api[_-]?key|token|secret|password)[a-z_-]*)"\s*:\s*)"(?:[^"\\\\]|\\\\.)*(?:"|$)/i', '$1"[REDACTED]"', $data);
 
             return is_string($scrubbed) ? $scrubbed : $data;
         }

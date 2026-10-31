@@ -27,7 +27,7 @@ From this repository, copy the whole `modules/` tree into the WHMCS installation
 
 In WHMCS, go to `Configuration -> System Settings -> Addon Modules`, find `Releem Setup`, and activate it. Grant access to the administrator roles that should be able to configure products. Product Setup additionally requires the `Edit Products/Services` admin permission.
 
-The addon has one setting, **Link existing Releem customers by email** (off by default). With it off, an existing Releem customer is only linked to a WHMCS client whose email is verified in WHMCS. Enable it only if you trust your clients' email addresses.
+The addon has one setting, **Link existing Releem customers by email** (off by default). With it off, an existing Releem customer is only linked to a WHMCS client whose email is verified in WHMCS. On WHMCS 8, the account owner's verified user email must match the client's email used for linking. A verified user with a different email does not qualify. Enable the setting only if you trust your clients' email addresses; it does not bypass verification when displaying an adopted customer's public API key.
 
 Keep the addon active: deactivating it stops the renewal and daily reconcile hooks.
 
@@ -125,7 +125,9 @@ WHMCS field mapping:
 
 `releem_public_api_key` is the only product custom field managed automatically by this module. `Setup Product` creates or reuses it; if it is still missing, a successful sync creates it lazily when the API returns a public key.
 
-The value is stored on the service's product custom-field record.
+The value is stored on the service's admin-only product custom-field record. For an adopted customer, the module caches
+the key before email verification but only displays it after the original adoption email is verified. No additional
+sync is needed after verification. Changing the profile to a different verified email does not reveal that key.
 
 ## Internal Metadata
 
@@ -142,6 +144,7 @@ Stored there:
 - `status`
 - `valid_to`
 - `adopted` (customer was found by email rather than created by this module)
+- `adopted_email_hash` (hash of the original email used for adoption; never replaced by later profile email changes)
 - `updated_at`
 
 The module creates the `mod_releem_service_meta` table lazily during sync if it does not already exist.
@@ -168,6 +171,68 @@ Developer note: the source of truth for customer payloads and responses is `../r
 No delete operation is used. Service lifecycle changes are sent through `subscription.status`.
 
 ## Troubleshooting
+
+### Restore access to an adopted customer's public API key
+
+An adopted service can keep its key hidden when its metadata predates `adopted_email_hash`, or when the legitimate
+owner changes their WHMCS email. Verifying the new address alone does not restore access: the module deliberately
+requires the original adoption email. There is currently no addon action to approve a replacement address.
+
+An administrator can approve the current address manually:
+
+1. Independently confirm that the WHMCS client owns the **existing Releem customer ID** recorded for this service,
+   using the authenticated Releem account or Releem support. WHMCS email verification alone does not prove ownership
+   of that Releem customer. Record the approval in your support/change records.
+2. On WHMCS 8, have the account owner verify their user email and ensure it matches the client's profile email.
+   Confirm the intended service is Active. Back up its `mod_releem_service_meta` row before editing it.
+3. Generate the hash with the same normalization as the module. Replace the example with the approved current email:
+
+   ```sh
+   php -r 'echo hash("sha256", strtolower(trim($argv[1]))), PHP_EOL;' 'verified@example.com'
+   ```
+
+4. In one database session, start a transaction and inspect the exact service row. Replace `12345` with its WHMCS
+   service ID. Check the client ID, email, Releem customer ID and `adopted=1` against the ownership confirmation:
+
+   ```sql
+   START TRANSACTION;
+
+   SELECT h.id AS service_id, h.userid AS client_id, c.email,
+          m.customer_id, m.adopted, m.adopted_email_hash
+   FROM mod_releem_service_meta AS m
+   JOIN tblhosting AS h ON h.id = m.service_id
+   JOIN tblclients AS c ON c.id = h.userid
+   WHERE m.service_id = 12345
+   FOR UPDATE;
+   ```
+
+5. Update only this service's hash. Replace all example values below, including the hash from step 3. The email
+   condition must match the stored profile email exactly; it prevents applying approval to a changed address.
+
+   ```sql
+   UPDATE mod_releem_service_meta AS m
+   JOIN tblhosting AS h ON h.id = m.service_id
+   JOIN tblclients AS c ON c.id = h.userid
+   SET m.adopted_email_hash = '<64-character-hash-from-step-3>',
+       m.updated_at = UTC_TIMESTAMP()
+   WHERE m.service_id = 12345
+     AND h.userid = 678
+     AND m.customer_id = 'confirmed-releem-customer-id'
+     AND m.adopted = 1
+     AND BINARY c.email = BINARY 'verified@example.com';
+
+   SELECT ROW_COUNT() AS updated_rows;
+   ```
+
+   Expect one updated row. If the identity does not match or the update count is not one, run `ROLLBACK;` and
+   investigate. Otherwise run `COMMIT;`. Keep `adopted=1`, `customer_id` and `subscription_id` unchanged. Do not
+   bulk-update other services linked to the customer without separately confirming their ownership.
+6. Reload the customer's service page. If the admin-only `releem_public_api_key` field already contains the key, it
+   becomes visible immediately. If it is empty, run **Sync with Releem** on the existing service in the WHMCS admin
+   area to refill it from the API, then reload the page. If sync succeeds but the field remains empty, contact Releem
+   support. Do not remove the customer link or create a replacement customer to recover the key.
+
+### Other errors
 
 - **`Releem secret key is not configured or could not be decrypted`**
   - Action: add a Releem server record with the partner token as its password and assign it to the product. Re-enter the password if the WHMCS encryption hash changed.
@@ -204,6 +269,27 @@ No delete operation is used. Service lifecycle changes are sent through `subscri
 
 - **`Releem sync failed. Check module log.`**
   - Action: open `Configuration -> System Logs -> Module Log`, inspect the matching `sync`, `createCustomer`, or `updateCustomer` entry, correct the reported API or WHMCS data issue, and retry the module action.
+
+## Automated regression tests
+
+Run each `tests/test_*.php` script with PHP 7.4 or later. They use synthetic transports and do not contact Releem or
+require a WHMCS installation. For example:
+
+```sh
+php tests/test_api_response_safety.php
+php tests/test_security_hardening.php
+```
+
+Browser regressions require Node.js 22 or later and Chrome/Chromium, without npm packages:
+
+```sh
+node tests/test_frontend.mjs
+# For another browser executable:
+CHROME_BIN=chromium node tests/test_frontend.mjs
+```
+
+These run the actual template/hook JavaScript in isolated desktop and mobile DOM fixtures. They make no API calls,
+execute no installer commands, and do not replace the manual verification of WHMCS billing and theme integration.
 
 ## Support
 

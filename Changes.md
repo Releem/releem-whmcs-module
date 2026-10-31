@@ -3,6 +3,81 @@
 All notable changes to the Releem WHMCS module. The `Releem Setup` addon version (shown in
 `Addons -> Releem Setup`) is the module release number. Releases before 1.3.1 were not tracked here.
 
+## 1.3.3 - 2026-10-30
+
+### Security
+
+- API error bodies are redacted before truncation, including escaped JSON keys/values, so cutting an error cannot
+  leave most of a partner token or public API key in the Module Log. Non-JSON error bodies are omitted; the HTTP
+  status remains available for diagnosis.
+- Empty or invalid customer lookup responses no longer count as proof that a customer is absent. Valid empty lists,
+  exact matches and empty successful PATCH responses remain supported.
+
+### Fixed
+
+- The installation wizard rejects memory limits that cannot be represented as safe whole numbers.
+- Support links stay within 2000 characters after Unicode encoding and show a notice when the message is shortened.
+- Windows commands clear a previously enabled query-optimization environment variable when optimization is disabled.
+- The Services table scrolls within its container on narrow screens.
+- The server form preserves original labels, row visibility, tooltips and placeholders, and adapts when WHMCS
+  replaces the table or module selector dynamically.
+
+### Added
+
+- API response safety tests and dependency-free browser regressions for the wizard and server form.
+
+## 1.3.2 - 2026-10-29
+
+Security and reliability fixes since 1.3.1. No Releem API contract changes.
+
+### Security
+
+- Email adoption and adopted-customer API key visibility use the WHMCS 8 account owner's verification status and
+  require the verified user email to match the client email. The legacy client verification flag is used only on
+  WHMCS versions without separate user accounts.
+- Adopted customers retain a hash of the original matched email. Changing the profile to a different verified email
+  never reveals the original customer's key, including when reusing that customer for a sibling service.
+- The public API key is cached in an admin-only custom field and displayed only after the original adoption email
+  is verified. Verification makes it available immediately without another sync. Missing customer metadata or
+  adoption provenance denies access. Adoption stops if its identity cannot be saved before caching the key.
+- Provisioning reads the partner token from the server record with strict decryption. An undecryptable
+  `serverpassword` parameter is not sent as the token. Test Connection still accepts an unsaved plain-text token.
+- Legacy API endpoints now reject malformed DNS hostnames and non-root paths, and are rebuilt as canonical HTTPS
+  origins from validated hostnames and ports.
+
+### Fixed
+
+- A successfully provisioned active service keeps ownership regardless of service ID. A later lower-ID service
+  cannot take over its subscription, and unprovisioned duplicates cannot block its sync or reconciliation.
+- A previously provisioned owner retains priority after suspension, so an unprovisioned lower-ID duplicate cannot
+  block unsuspend or restoration. A different live provisioned owner still takes priority over a former owner.
+- Suspending or terminating the owner sends `deleted` despite unprovisioned Active duplicates. Ending a duplicate
+  preserves the provisioned owner's subscription. Ending an unlinked service never adopts a sibling's customer.
+- Daily reconciliation calculates Free and One Time `valid_to` from the registration date in the same way as sync.
+  It performs ownership queries only after detecting status, billing-window or server-count drift.
+- Sync stops if the MySQL client lock is unavailable, instead of running without serialization. Acquired locks are
+  released after both successful and failed syncs.
+- The adoption error uses the exact addon setting name: **Link existing Releem customers by email**.
+
+### Added
+
+- README procedure for an administrator to restore adopted-key access after independently confirming customer
+  ownership, including a guarded update of the approved email hash and recovery of an empty key cache.
+- `mod_releem_service_meta.adopted_email_hash`, added automatically on first use, stores the original adoption
+  identity without keeping the email itself in metadata.
+- Regression coverage for service ownership and lifecycle changes, client locking, reconciliation windows, WHMCS 8
+  verification, adoption provenance, key visibility and caching, and endpoint validation.
+
+### Upgrade notes
+
+1. Copy the whole `modules/` tree over the existing install. The Releem Setup addon now reports **1.3.2**.
+2. The metadata table gains `adopted_email_hash` automatically on first use; the WHMCS database user needs permission
+   to alter that table.
+3. Existing adopted rows without the original email hash keep their keys hidden. The module deliberately does not
+   infer adoption provenance from the current profile email.
+4. The WHMCS database connection must support the MySQL named lock used by the module. If acquiring the lock fails,
+   sync stops and records the error in the Module Log.
+
 ## 1.3.1 - 2026-10-25
 
 Security and reliability release following a full code audit. No Releem API contract changes.
