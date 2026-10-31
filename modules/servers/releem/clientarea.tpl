@@ -51,7 +51,8 @@
         var API_KEY = root.getAttribute('data-api-key') || '';
         var TICKET_URL = root.getAttribute('data-ticket-url') || 'submitticket.php';
         var TICKET_DEPT = parseInt(root.getAttribute('data-ticket-dept') || '0', 10) || 0;
-        var MAX_MESSAGE = 1500; // keeps the pre-filled ticket link within URL length limits
+        var MAX_MESSAGE = 1500;
+        var MAX_TICKET_URL = 2000; // includes the absolute URL and percent-encoded Unicode message
         var MANUAL_URL = root.getAttribute('data-manual-url') || '';
         var LOGO_BASE = root.getAttribute('data-logo-base') || '';
         var LOGOS = { mysql: 'mysql.svg', postgresql: 'postgresql.svg', mariadb: 'mariadb.svg', linux: 'linux.svg', windows: 'windows.svg', docker: 'docker.svg', kubernetes: 'kubernetes.svg', rds: 'rds.svg', aurora: 'aurora.svg', gcp: 'gcp.svg', azure: 'azure.svg', cpanel: 'cpanel.svg' };
@@ -248,20 +249,50 @@
             body.appendChild(stepTitle('We will help you connect this server'));
             var ta = el('textarea', { 'class': 'form-control', rows: '5', maxlength: String(MAX_MESSAGE), placeholder: 'Tell us about your database (type, version, where it runs) and what you need.' });
             var send = el('a', { 'class': 'btn btn-primary disabled', href: '#', text: 'Send a message' });
+            var limitNote = el('p', { 'class': 'rlm-help rlm-support-limit', role: 'status' });
             function sync() {
                 var v = ta.value.trim();
+                limitNote.textContent = '';
                 if (v === '') { send.className = 'btn btn-primary disabled'; send.href = '#'; return; }
-                send.className = 'btn btn-primary';
                 // step=2 only works together with a department; without one the client picks it on the first step.
                 send.href = TICKET_URL + '?' + (TICKET_DEPT > 0 ? 'step=2&deptid=' + TICKET_DEPT + '&' : '')
                     + 'subject=' + encodeURIComponent('Releem: connect a database server')
-                    + '&message=' + encodeURIComponent(v.substring(0, MAX_MESSAGE));
+                    + '&message=';
+                var remaining = Math.max(0, MAX_TICKET_URL - send.href.length);
+                var message = '';
+                var end = 0;
+                while (end < v.length && end < MAX_MESSAGE) {
+                    var character = v.charAt(end);
+                    var code = v.charCodeAt(end);
+                    var units = 1;
+                    if (code >= 0xD800 && code <= 0xDBFF && end + 1 < v.length
+                        && v.charCodeAt(end + 1) >= 0xDC00 && v.charCodeAt(end + 1) <= 0xDFFF) {
+                        character += v.charAt(end + 1);
+                        units = 2;
+                    } else if (code >= 0xD800 && code <= 0xDFFF) {
+                        character = '\uFFFD';
+                    }
+                    // The URL serializer also escapes apostrophes in HTTPS query strings.
+                    var encoded = encodeURIComponent(character).replace(/[!'()*]/g, function (c) {
+                        return '%' + c.charCodeAt(0).toString(16).toUpperCase();
+                    });
+                    if (encoded.length > remaining || end + units > MAX_MESSAGE) { break; }
+                    message += encoded;
+                    remaining -= encoded.length;
+                    end += units;
+                }
+                if (end < v.length) {
+                    limitNote.textContent = 'Your message was shortened to fit the support link. Add the remaining details on the ticket page.';
+                }
+                send.className = message !== '' ? 'btn btn-primary' : 'btn btn-primary disabled';
+                send.href = message !== '' ? send.href + message : '#';
             }
             ta.addEventListener('input', sync);
             send.addEventListener('click', function (e) { if (/disabled/.test(send.className)) { e.preventDefault(); } });
             var wrap = el('div', { 'class': 'rlm-result' }, [
                 el('label', { text: 'Message' }), ta,
                 el('div', { style: 'margin-top:12px;' }, [send]),
+                limitNote,
                 el('p', { 'class': 'rlm-help', style: 'margin-top:12px;' }, [
                     document.createTextNode('Or follow the '),
                     el('a', { href: MANUAL_URL, target: '_blank', rel: 'noopener', text: 'manual installation documentation' }),
@@ -279,8 +310,9 @@
         function parseMemory(raw) {
             raw = (raw || '').trim();
             if (raw === '') { return { value: 0, error: '' }; }
-            if (!/^\d+$/.test(raw) || parseInt(raw, 10) < 384) { return { value: null, error: 'Enter a whole number of 384 MB or more, or leave empty for all server memory.' }; }
-            return { value: parseInt(raw, 10), error: '' };
+            var value = Number(raw);
+            if (!/^\d+$/.test(raw) || !isFinite(value) || value < 384 || value > 9007199254740991) { return { value: null, error: 'Enter a valid whole number of 384 MB or more, or leave empty for all server memory.' }; }
+            return { value: value, error: '' };
         }
 
         function buildScript(os, db, mem, queryOptimization) {
@@ -290,7 +322,11 @@
             if (os === 'windows') {
                 var ps = ['$env:RELEEM_DB_MEMORY_LIMIT=' + mem, '$env:RELEEM_API_KEY=' + psQuote(API_KEY), '$env:RELEEM_CRON_ENABLE=1'];
                 if (queryOptimization) { ps.push('$env:RELEEM_QUERY_OPTIMIZATION="true"'); }
-                ps.push('iwr -useb https://releem.s3.amazonaws.com/v2/install.ps1 | iex');
+                else { ps.push('Remove-Item Env:RELEEM_QUERY_OPTIMIZATION -ErrorAction SilentlyContinue'); }
+                ps.push('[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12');
+                ps.push("$releemInstaller = 'https://releem.s3.amazonaws.com/v2/install.ps1'");
+                ps.push("if ($releemInstaller -notlike 'https://*') { throw 'Releem installer URL must use HTTPS' }");
+                ps.push('Invoke-Expression (Invoke-WebRequest -UseBasicParsing -Uri $releemInstaller).Content');
                 return ps.join('; ');
             }
             var parts = [db === 'postgresql' ? 'RELEEM_PG_TYPE=1' : 'RELEEM_MYSQL_TYPE=1',

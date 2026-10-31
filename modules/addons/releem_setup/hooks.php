@@ -42,16 +42,49 @@ add_hook('AdminAreaFooterOutput', 1, function (array $vars) {
 (function () {
     var TYPE = 'releem';
     var LABEL = 'Partner API Token';
-    var saved = {};
+    // Original state belongs to the actual element, including rows replaced by WHMCS AJAX.
+    var saved = new WeakMap();
     var observer = null;
 
     function row(el) { return el ? el.closest('tr') : null; }
 
-    function apply() {
-        var select = document.getElementById('inputServerType');
-        if (!select) { return; }
-        var wanted = select.value === TYPE;
+    function read(el, key) {
+        if (key === 'display') { return el.style.display; }
+        if (key === 'html') { return el.innerHTML; }
+        return el.getAttribute(key);
+    }
 
+    function write(el, key, value) {
+        if (key === 'display') { el.style.display = value; }
+        else if (key === 'html') { el.innerHTML = value; }
+        else if (value === null) { el.removeAttribute(key); }
+        else { el.setAttribute(key, value); }
+    }
+
+    function adjust(el, key, value) {
+        if (!el) { return; }
+        var original = saved.get(el) || {};
+        if (!Object.prototype.hasOwnProperty.call(original, key)) { original[key] = read(el, key); }
+        saved.set(el, original);
+        if (read(el, key) !== value) { write(el, key, value); }
+    }
+
+    function restore(el) {
+        if (!el || !saved.has(el)) { return; }
+        var original = saved.get(el);
+        Object.keys(original).forEach(function (key) { write(el, key, original[key]); });
+        saved.delete(el);
+    }
+
+    function watch() {
+        // The table and type selector can both be replaced; the document body remains stable.
+        if (observer && document.body) { observer.observe(document.body, {childList: true, subtree: true}); }
+    }
+
+    function apply() {
+        if (observer) { observer.disconnect(); }
+        var select = document.getElementById('inputServerType');
+        if (!select) { watch(); return; }
         var username = row(document.getElementById('inputUsername'));
         var password = document.getElementById('inputPassword');
         var passwordRow = row(password);
@@ -59,42 +92,23 @@ add_hook('AdminAreaFooterOutput', 1, function (array $vars) {
         var hostname = document.getElementById('inputHostname');
         var label = passwordRow ? passwordRow.querySelector('td.fieldlabel') : null;
 
-        // Our own edits must not retrigger the observer.
-        if (observer) { observer.disconnect(); }
-
-        if (wanted) {
-            if (username) { username.style.display = 'none'; }
-            if (hashRow) { hashRow.style.display = 'none'; }
-            if (label && label.textContent.trim() !== LABEL) {
-                if (saved.label === undefined) { saved.label = label.innerHTML; }
-                label.textContent = LABEL;
-            }
-            if (password) { password.setAttribute('title', 'Releem partner API token'); }
-            if (hostname && !hostname.getAttribute('placeholder')) { hostname.setAttribute('placeholder', 'api2.releem.com'); }
+        if (select.value === TYPE) {
+            adjust(username, 'display', 'none');
+            adjust(hashRow, 'display', 'none');
+            adjust(label, 'html', LABEL);
+            adjust(password, 'title', 'Releem partner API token');
+            if (hostname && !hostname.getAttribute('placeholder')) { adjust(hostname, 'placeholder', 'api2.releem.com'); }
         } else {
-            if (username) { username.style.display = ''; }
-            if (hashRow) { hashRow.style.display = ''; }
-            if (label && saved.label !== undefined) { label.innerHTML = saved.label; saved.label = undefined; }
-            if (password) { password.removeAttribute('title'); }
-            if (hostname && hostname.getAttribute('placeholder') === 'api2.releem.com') { hostname.removeAttribute('placeholder'); }
+            [username, hashRow, label, password, hostname].forEach(restore);
         }
-
         watch();
     }
 
-    function watch() {
-        var select = document.getElementById('inputServerType');
-        var table = select ? select.closest('table') : null;
-        if (window.MutationObserver && table) {
-            if (!observer) { observer = new MutationObserver(apply); }
-            observer.observe(table, {childList: true, subtree: true});
-        }
-    }
-
     function init() {
-        var select = document.getElementById('inputServerType');
-        if (!select) { return; }
-        select.addEventListener('change', apply);
+        document.addEventListener('change', function (event) {
+            if (event.target && event.target.id === 'inputServerType') { apply(); }
+        });
+        if (window.MutationObserver) { observer = new MutationObserver(apply); }
         apply();
     }
 

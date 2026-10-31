@@ -21,7 +21,7 @@ foreach (['127.0.0.1', '169.254.169.254', 'localhost', 'api2.releem.com.evil.com
     $built = releem_server_build_endpoint_from_server($host, '', 'on');
     check($built['error'] !== '', 'Expected host to be refused: ' . $host);
 }
-foreach (['https://evil.com', 'https://127.0.0.1', 'https://api2.releem.com@evil.com', 'http://api2.releem.com'] as $url) {
+foreach (['https://evil.com', 'https://127.0.0.1', 'https://api2.releem.com@evil.com', 'http://api2.releem.com', 'https://evil.com\\.releem.com', 'https://127.0.0.1%2f.releem.com', 'https://127.0.0.1%00.releem.com', 'https://bad..releem.com', 'https://-bad.releem.com', 'https://api2.releem.com/v1', 'https://api2.releem.com:0'] as $url) {
     $refused = false;
     try {
         ReleemServerApi::normalizeEndpoint($url);
@@ -32,6 +32,13 @@ foreach (['https://evil.com', 'https://127.0.0.1', 'https://api2.releem.com@evil
 }
 check(ReleemServerApi::normalizeEndpoint('https://api2.releem.com/') === 'https://api2.releem.com', 'Expected trailing slash to be trimmed.');
 check(ReleemServerApi::normalizeEndpoint('') === 'https://api2.releem.com', 'Expected the default endpoint for an empty value.');
+
+check(ReleemServerApi::normalizeEndpoint('HTTPS://API2.RELEEM.COM.:443/') === 'https://api2.releem.com', 'Expected a canonical HTTPS origin.');
+check(ReleemServerApi::normalizeEndpoint('https://api2.releem.com:8443/') === 'https://api2.releem.com:8443', 'Expected a valid custom port to be preserved.');
+
+// WHMCS versions without separate user accounts keep verification on the client.
+check(releem_server_client_email_is_verified((object) ['email'=>'client@example.invalid', 'email_verified'=>1]), 'Expected legacy verified clients to remain supported.');
+check(!releem_server_client_email_is_verified((object) ['email'=>'client@example.invalid', 'email_verified'=>0]), 'Expected legacy unverified clients to be refused.');
 
 // Log redaction: secrets, personal data and email addresses inside free text.
 releem_server_register_secret('tok_abcdef123');
