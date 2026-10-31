@@ -21,7 +21,7 @@ From this repository, copy the whole `modules/` tree into the WHMCS installation
 - `modules/servers/releem/` (`releem.php`, `clientarea.tpl`, `assets/logos/`)
 - `modules/addons/releem_setup/` (`releem_setup.php`, `hooks.php`, `assets/`)
 
-`hooks.php` keeps Releem subscriptions in sync on renewals and runs the daily reconcile; it is only loaded while the `Releem Setup` addon is active. See `Changes.md` for release notes and upgrade steps.
+`hooks.php` keeps Releem subscriptions in sync on renewals and runs the daily reconcile; it is only loaded while the `Releem Setup` addon is active. See [Changes.md](Changes.md) for release notes and the in-place upgrade steps, including upgrades from 1.3.1.
 
 ## 2. Activate the setup addon
 
@@ -174,63 +174,8 @@ No delete operation is used. Service lifecycle changes are sent through `subscri
 
 ### Restore access to an adopted customer's public API key
 
-An adopted service can keep its key hidden when its metadata predates `adopted_email_hash`, or when the legitimate
-owner changes their WHMCS email. Verifying the new address alone does not restore access: the module deliberately
-requires the original adoption email. There is currently no addon action to approve a replacement address.
-
-An administrator can approve the current address manually:
-
-1. Independently confirm that the WHMCS client owns the **existing Releem customer ID** recorded for this service,
-   using the authenticated Releem account or Releem support. WHMCS email verification alone does not prove ownership
-   of that Releem customer. Record the approval in your support/change records.
-2. On WHMCS 8, have the account owner verify their user email and ensure it matches the client's profile email.
-   Confirm the intended service is Active. Back up its `mod_releem_service_meta` row before editing it.
-3. Generate the hash with the same normalization as the module. Replace the example with the approved current email:
-
-   ```sh
-   php -r 'echo hash("sha256", strtolower(trim($argv[1]))), PHP_EOL;' 'verified@example.com'
-   ```
-
-4. In one database session, start a transaction and inspect the exact service row. Replace `12345` with its WHMCS
-   service ID. Check the client ID, email, Releem customer ID and `adopted=1` against the ownership confirmation:
-
-   ```sql
-   START TRANSACTION;
-
-   SELECT h.id AS service_id, h.userid AS client_id, c.email,
-          m.customer_id, m.adopted, m.adopted_email_hash
-   FROM mod_releem_service_meta AS m
-   JOIN tblhosting AS h ON h.id = m.service_id
-   JOIN tblclients AS c ON c.id = h.userid
-   WHERE m.service_id = 12345
-   FOR UPDATE;
-   ```
-
-5. Update only this service's hash. Replace all example values below, including the hash from step 3. The email
-   condition must match the stored profile email exactly; it prevents applying approval to a changed address.
-
-   ```sql
-   UPDATE mod_releem_service_meta AS m
-   JOIN tblhosting AS h ON h.id = m.service_id
-   JOIN tblclients AS c ON c.id = h.userid
-   SET m.adopted_email_hash = '<64-character-hash-from-step-3>',
-       m.updated_at = UTC_TIMESTAMP()
-   WHERE m.service_id = 12345
-     AND h.userid = 678
-     AND m.customer_id = 'confirmed-releem-customer-id'
-     AND m.adopted = 1
-     AND BINARY c.email = BINARY 'verified@example.com';
-
-   SELECT ROW_COUNT() AS updated_rows;
-   ```
-
-   Expect one updated row. If the identity does not match or the update count is not one, run `ROLLBACK;` and
-   investigate. Otherwise run `COMMIT;`. Keep `adopted=1`, `customer_id` and `subscription_id` unchanged. Do not
-   bulk-update other services linked to the customer without separately confirming their ownership.
-6. Reload the customer's service page. If the admin-only `releem_public_api_key` field already contains the key, it
-   becomes visible immediately. If it is empty, run **Sync with Releem** on the existing service in the WHMCS admin
-   area to refill it from the API, then reload the page. If sync succeeds but the field remains empty, contact Releem
-   support. Do not remove the customer link or create a replacement customer to recover the key.
+The complete upgrade and key recovery procedure is in the
+[1.3.3 changelog](Changes.md#restore-access-to-an-adopted-customers-public-api-key).
 
 ### Other errors
 
