@@ -97,6 +97,8 @@ Current fields:
 - `subscription_id`
 - `number_servers`
 - `status`
+- `valid_to`
+- `adopted`
 - `updated_at`
 
 This table is used instead of product custom fields for internal linkage.
@@ -112,7 +114,7 @@ Typical flow:
 1. Read product, client, service, and selected server count.
 2. Resolve Releem customer:
    - use stored `customer_id` from `mod_releem_service_meta`
-   - otherwise look up by email through `GET /v1/customers?filter={email}`
+   - otherwise (never when ending a subscription) look up by email through `GET /v1/customers?filter={email}`; link it only when the client's email is verified or the addon setting `allow_email_adoption` is on, and never overwrite the name of such an adopted customer
    - otherwise create new customer
 3. Build update payload with:
    - `name`
@@ -130,7 +132,7 @@ Typical flow:
 
 WHMCS field mapping:
 
-- `subscription.id` -> numeric service `subscriptionid`
+- `subscription.id` -> WHMCS service ID (gateway `subscriptionid` is intentionally not used)
 - `subscription.started_at` -> service `regdate` at start of day UTC
 - `subscription.valid_to` -> service `nextduedate` at end of day UTC
 - `subscription.number_servers` -> selected `Servers` configurable option value
@@ -196,6 +198,10 @@ Expected update payload shape:
 - Suspend, cancel, and terminate all map to `deleted` in the API payload.
 - The module does not call `DELETE /v1/customers/{id}`.
 - `CustomerResponse.api_key` is the public API key shown to customers.
+
+## Release Notes
+
+Every change set is recorded in `Changes.md`, and the `Releem Setup` addon version in `releem_setup_config()` is the release number. Bump the last component and add a `Changes.md` entry with each change.
 
 ## Editing Guidance
 

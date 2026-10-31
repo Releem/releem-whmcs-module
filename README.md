@@ -16,17 +16,20 @@ The partner API key is a secret used by WHMCS for customer-management API calls.
 
 ## 1. Upload the module files
 
-From this repository, copy all three paths below relative to the WHMCS installation root:
+From this repository, copy the whole `modules/` tree into the WHMCS installation root (keep the directory structure):
 
-- `modules/servers/releem/releem.php`
-- `modules/servers/releem/clientarea.tpl`
-- `modules/addons/releem_setup/releem_setup.php`
+- `modules/servers/releem/` (`releem.php`, `clientarea.tpl`, `assets/logos/`)
+- `modules/addons/releem_setup/` (`releem_setup.php`, `hooks.php`, `assets/`)
 
-No other files are required for the recommended standalone-product flow.
+`hooks.php` keeps Releem subscriptions in sync on renewals and runs the daily reconcile; it is only loaded while the `Releem Setup` addon is active. See `Changes.md` for release notes and upgrade steps.
 
 ## 2. Activate the setup addon
 
-In WHMCS, go to `Configuration -> System Settings -> Addon Modules`, find `Releem Setup`, and activate it. Grant access to the administrator roles that should be able to configure products.
+In WHMCS, go to `Configuration -> System Settings -> Addon Modules`, find `Releem Setup`, and activate it. Grant access to the administrator roles that should be able to configure products. Product Setup additionally requires the `Edit Products/Services` admin permission.
+
+The addon has one setting, **Link existing Releem customers by email** (off by default). With it off, an existing Releem customer is only linked to a WHMCS client whose email is verified in WHMCS. Enable it only if you trust your clients' email addresses.
+
+Keep the addon active: deactivating it stops the renewal and daily reconcile hooks.
 
 This runbook uses WHMCS 9 navigation. Older WHMCS versions may use `Setup` and `Utilities` menu labels instead of `Configuration`.
 
@@ -42,9 +45,11 @@ The product must have server type `releem` before it appears in `Addons -> Relee
 
 On the product's `Module Settings`, set:
 
-- `partner_api_key` — required secret partner key.
-- `api_endpoint` — use `https://api2.releem.com` in production, or `https://api2.dev.releem.com` for development/testing.
-- `server_count_option_id` — optional numeric override for the configurable option that represents server count. The recommended setup fills this automatically.
+The partner API token and endpoint come from a WHMCS server record (`Configuration -> System Settings -> Servers`, type `Releem`): Hostname `api2.releem.com` (or `api2.dev.releem.com` for testing), Port `443`, Secure enabled, and the partner API token as the Password. The hostname must be a `releem.com` host; the token is never sent anywhere else. Assign the server to the product through a server group.
+
+On the product's `Module Settings`:
+
+- `Number of Database Servers` — optional numeric override for the configurable option that represents server count. The recommended setup fills this automatically.
 
 For compatibility, older installations may use `plan_config_option_id` as a fallback. Do not expose the secret partner API key in customer-facing content or logs; the per-customer public API key is intentionally shown to that customer.
 
@@ -94,7 +99,7 @@ Create sends:
 
 Update sync sends:
 
-- `name`
+- `name` (not for customers linked by email; see Troubleshooting)
 - `subscription.id`
 - `subscription.started_at`
 - `subscription.valid_to`
@@ -107,11 +112,11 @@ Update sync sends:
 
 WHMCS field mapping:
 
-- `subscription.id` -> numeric service `subscriptionid`, with fallback to WHMCS service ID when `subscriptionid` is empty or nonnumeric
+- `subscription.id` -> WHMCS service ID (gateway `subscriptionid` values are not used; they could collide with another service's ID)
 - `subscription.started_at` -> service `regdate` at start of day UTC
 - `subscription.valid_to` -> service `nextduedate` at end of day UTC
 - `subscription.number_servers` -> selected `Servers` configurable option value
-- `subscription.amount` -> service `recurringamount` (fallback `amount`)
+- `subscription.amount` -> service `amount`, in the client's WHMCS currency (no currency code is sent)
 - `subscription.invoiceid` -> WHMCS `invoiceid` when present, otherwise `0`
 - `subscription.payment_method` -> human-friendly WHMCS payment method label
 - `subscription.status` -> `active` for active services, `deleted` for suspended/cancelled/terminated services
@@ -135,6 +140,8 @@ Stored there:
 - `subscription_id`
 - `number_servers`
 - `status`
+- `valid_to`
+- `adopted` (customer was found by email rather than created by this module)
 - `updated_at`
 
 The module creates the `mod_releem_service_meta` table lazily during sync if it does not already exist.
@@ -162,14 +169,23 @@ No delete operation is used. Service lifecycle changes are sent through `subscri
 
 ## Troubleshooting
 
-- **`Releem secret key is not configured`**
-  - Action: set `partner_api_key` in product `Module Settings`.
+- **`Releem secret key is not configured or could not be decrypted`**
+  - Action: add a Releem server record with the partner token as its password and assign it to the product. Re-enter the password if the WHMCS encryption hash changed.
+
+- **`Releem server address must be a releem.com host`**
+  - Action: set the server Hostname to `api2.releem.com` (or `api2.dev.releem.com`). IP addresses and other hosts are refused.
+
+- **`A Releem customer already exists for this client email, but the email is not verified in WHMCS`**
+  - Action: have the client verify their email, or enable **Link existing Releem customers by email** in the `Releem Setup` addon settings if you trust the address.
+
+- **`Releem subscription ID ... is already used by another service`**
+  - Action: an older sync used a gateway subscription ID that equals this service's ID. Contact Releem support to remap one of the subscriptions.
 
 - **`Unable to resolve selected server count`**
   - Action: set `server_count_option_id` to the correct configurable option ID and ensure the customer selected a numeric value.
 
 - **`Service subscription ID is missing or invalid`**
-  - Action: ensure the WHMCS service exists and has either a numeric `subscriptionid` or a valid numeric service ID.
+  - Action: ensure the WHMCS service exists and has a valid numeric service ID (at most 9 digits).
 
 - **`Service registration date is missing or invalid`**
   - Action: ensure the WHMCS service `regdate` is populated with a valid date.
@@ -180,7 +196,10 @@ No delete operation is used. Service lifecycle changes are sent through `subscri
 - **`Service payment method is missing`**
   - Action: ensure the WHMCS service has a payment method assigned.
 
-- **`Multiple customers found for email ...`**
+- **`Customer lookup returned a full page without an exact match`**
+  - Action: the Releem list endpoint returned many results and none matched the client email exactly. Ask Releem support to confirm whether the customer exists, then re-run sync.
+
+- **`Multiple Releem customers found for the client email`**
   - Action: identify the intended customer record, resolve or merge the duplicate records with Releem support, then re-run sync so the service links to one customer.
 
 - **`Releem sync failed. Check module log.`**
